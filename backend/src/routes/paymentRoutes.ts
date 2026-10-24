@@ -166,7 +166,7 @@ paymentRouter.post(
         orderNumber,
         isTestOrder: config.isTestMode,
         orderType: orderType === 'dealer' ? 'dealer' : 'customer',
-        dealer: dealerInfo,
+        ... (dealerInfo ? { dealer: dealerInfo } : {}),
         customer: {
           uid: user.uid,
           email: user.email || 'customer@califnco.com',
