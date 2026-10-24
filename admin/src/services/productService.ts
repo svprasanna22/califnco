@@ -9,6 +9,8 @@ import {
   serverTimestamp,
   query,
   orderBy,
+  onSnapshot,
+  type Unsubscribe,
   type Timestamp,
 } from 'firebase/firestore';
 import { db } from './firebase';
@@ -81,6 +83,149 @@ export async function fetchProducts(): Promise<Product[]> {
   } catch (error: unknown) {
     console.error('Error fetching products from Firestore:', error);
     throw new Error(getFriendlyFirestoreErrorMessage(error));
+  }
+}
+
+interface ProductSubscriber {
+  onData: (products: Product[]) => void;
+  onError?: (error: Error) => void;
+}
+
+let activeProductsUnsub: Unsubscribe | null = null;
+let cachedProducts: Product[] | null = null;
+let productsCleanupTimer: ReturnType<typeof setTimeout> | null = null;
+const productSubscribers = new Set<ProductSubscriber>();
+
+function startProductsListener() {
+  if (activeProductsUnsub) return;
+
+  const productsRef = collection(db, PRODUCTS_COLLECTION);
+  const q = query(productsRef, orderBy('createdAt', 'desc'));
+
+  const handleSnapshot = (snapshotDocs: Array<{ id: string; data: () => any }>) => {
+    const list: Product[] = snapshotDocs.map((docSnap) => ({
+      id: docSnap.id,
+      ...(docSnap.data() as Omit<Product, 'id'>),
+    }));
+    cachedProducts = list;
+    productSubscribers.forEach((sub) => {
+      try {
+        sub.onData(list);
+      } catch (err) {
+        console.error('Error in product subscriber callback:', err);
+      }
+    });
+  };
+
+  const handleListenerError = (error: unknown) => {
+    console.error('Error in products onSnapshot listener:', error);
+    const friendlyError = new Error(getFriendlyFirestoreErrorMessage(error));
+    productSubscribers.forEach((sub) => {
+      try {
+        sub.onError?.(friendlyError);
+      } catch (err) {
+        console.error('Error in product subscriber error callback:', err);
+      }
+    });
+  };
+
+  try {
+    activeProductsUnsub = onSnapshot(
+      q,
+      (snapshot) => {
+        handleSnapshot(snapshot.docs);
+      },
+      (error) => {
+        console.warn('Ordered products snapshot failed, falling back to unordered listener:', error);
+        if (activeProductsUnsub) {
+          activeProductsUnsub();
+          activeProductsUnsub = null;
+        }
+        try {
+          activeProductsUnsub = onSnapshot(
+            productsRef,
+            (fallbackSnap) => {
+              handleSnapshot(fallbackSnap.docs);
+            },
+            (fallbackError) => {
+              handleListenerError(fallbackError);
+            }
+          );
+        } catch (innerError) {
+          handleListenerError(innerError);
+        }
+      }
+    );
+  } catch (initialError) {
+    handleListenerError(initialError);
+  }
+}
+
+function stopProductsListenerImmediate() {
+  if (productsCleanupTimer) {
+    clearTimeout(productsCleanupTimer);
+    productsCleanupTimer = null;
+  }
+  if (activeProductsUnsub) {
+    activeProductsUnsub();
+    activeProductsUnsub = null;
+  }
+}
+
+/**
+ * Subscribes to real-time changes in the products collection using Firestore onSnapshot.
+ * Employs a shared, reference-counted listener with a 10s retention grace period to avoid
+ * duplicate listeners and redundant collection reads across admin view switches (Spark plan).
+ *
+ * @param onData Callback receiving updated products array
+ * @param onError Optional callback receiving Firestore errors
+ * @returns Unsubscribe function to release the listener on unmount
+ */
+export function subscribeToProducts(
+  onData: (products: Product[]) => void,
+  onError?: (error: Error) => void
+): () => void {
+  const subscriber: ProductSubscriber = { onData, onError };
+  productSubscribers.add(subscriber);
+
+  if (productsCleanupTimer) {
+    clearTimeout(productsCleanupTimer);
+    productsCleanupTimer = null;
+  }
+
+  // Deliver cached snapshot immediately if available to eliminate UI blank flash
+  if (cachedProducts !== null) {
+    try {
+      onData(cachedProducts);
+    } catch (e) {
+      console.error('Error delivering cached products:', e);
+    }
+  }
+
+  if (!activeProductsUnsub) {
+    startProductsListener();
+  }
+
+  return () => {
+    productSubscribers.delete(subscriber);
+    if (productSubscribers.size === 0) {
+      // 10s grace period allows instant tab switching between Dashboard, Products, Inventory without extra Firestore reads
+      productsCleanupTimer = setTimeout(() => {
+        if (productSubscribers.size === 0) {
+          stopProductsListenerImmediate();
+        }
+      }, 10000);
+    }
+  };
+}
+
+/**
+ * Forces a clean restart of the real-time products listener (used for retry buttons)
+ */
+export function restartProductsSubscription(): void {
+  stopProductsListenerImmediate();
+  if (productSubscribers.size > 0) {
+    startProductsListener();
   }
 }
 

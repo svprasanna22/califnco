@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import {
-  fetchProducts,
+  subscribeToProducts,
+  restartProductsSubscription,
   createProduct,
   updateProduct,
   removeProduct,
@@ -52,23 +53,36 @@ export function ProductsView() {
   const [isCleanupModalOpen, setIsCleanupModalOpen] = useState(false);
   const [isCleaning, setIsCleaning] = useState(false);
 
-  const loadProducts = useCallback(async () => {
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const [retryTrigger, setRetryTrigger] = useState(0);
+
+  const handleManualRefresh = useCallback(() => {
     setLoading(true);
     setError(null);
-    try {
-      const data = await fetchProducts();
-      setProducts(data);
-    } catch (err: unknown) {
-      const msg = (err as Error)?.message || 'Failed to load products from Cloud Firestore.';
-      setError(msg);
-    } finally {
-      setLoading(false);
-    }
+    restartProductsSubscription();
+    setRetryTrigger((prev) => prev + 1);
   }, []);
 
   useEffect(() => {
-    loadProducts();
-  }, [loadProducts]);
+    setLoading(true);
+    setError(null);
+
+    const unsub = subscribeToProducts(
+      (data) => {
+        setProducts(data);
+        setLoading(false);
+        setLastUpdated(new Date());
+      },
+      (err) => {
+        setError(err.message || 'Failed to sync products from Cloud Firestore.');
+        setLoading(false);
+      }
+    );
+
+    return () => {
+      unsub();
+    };
+  }, [retryTrigger]);
 
   const showSuccess = (msg: string) => {
     setSuccessMessage(msg);
@@ -94,7 +108,6 @@ export function ProductsView() {
       await createProduct(data, adminUid);
       showSuccess(`"${data.name}" added to catalog.`);
     }
-    await loadProducts();
   };
 
   const handleConfirmDelete = async () => {
@@ -104,7 +117,6 @@ export function ProductsView() {
       await removeProduct(deletingProduct.id);
       showSuccess(`"${deletingProduct.name}" removed from catalog.`);
       setDeletingProduct(null);
-      await loadProducts();
     } catch (err: unknown) {
       const msg = (err as Error)?.message || 'Failed to delete product.';
       setError(msg);
@@ -120,7 +132,6 @@ export function ProductsView() {
       const result = await seed50DemoProducts(adminUid);
       showSuccess(result.message);
       setIsSeedingModalOpen(false);
-      await loadProducts();
     } catch (err: unknown) {
       const msg = (err as Error)?.message || 'Failed to seed demo products.';
       setError(msg);
@@ -135,7 +146,6 @@ export function ProductsView() {
       const result = await cleanupDemoProducts();
       showSuccess(result.message);
       setIsCleanupModalOpen(false);
-      await loadProducts();
     } catch (err: unknown) {
       const msg = (err as Error)?.message || 'Failed to remove demo products.';
       setError(msg);
@@ -207,12 +217,12 @@ export function ProductsView() {
           <div style={{ flex: 1 }}>
             <div>{error}</div>
             <button
-              onClick={loadProducts}
+              onClick={handleManualRefresh}
               className="btn-secondary"
               style={{ marginTop: 8, height: 28, padding: '0 10px', fontSize: 11 }}
             >
               <RefreshIcon style={{ width: 12, height: 12 }} />
-              <span>Retry Firestore Query</span>
+              <span>Retry Connection</span>
             </button>
           </div>
         </div>
@@ -228,6 +238,10 @@ export function ProductsView() {
           <div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
               <h2 className="section-panel-title">Water Purifier & Cartridge Catalog</h2>
+              <span className="live-badge" title="Live streaming products from Cloud Firestore">
+                <span className="live-dot" />
+                LIVE SYNC
+              </span>
               {demoProductsCount > 0 ? (
                 <span
                   style={{
@@ -263,15 +277,21 @@ export function ProductsView() {
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            {lastUpdated && (
+              <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                Live as of {lastUpdated.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+              </span>
+            )}
+
             <button
-              onClick={loadProducts}
+              onClick={handleManualRefresh}
               className="btn-secondary"
               disabled={loading}
-              title="Refresh catalog from Firestore"
-              aria-label="Refresh catalog"
+              title="Re-sync catalog from Firestore"
+              aria-label="Re-sync catalog"
             >
               <RefreshIcon style={{ width: 14, height: 14 }} className={loading ? 'animate-spin' : ''} />
-              <span>Refresh</span>
+              <span>Re-sync</span>
             </button>
 
             {/* Seed 50 Demo Products Button (Requirement E) */}

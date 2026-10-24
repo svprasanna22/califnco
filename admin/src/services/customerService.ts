@@ -1,4 +1,4 @@
-import { fetchOrders, type Order } from './orderService';
+import { fetchOrders, subscribeToOrders, restartOrdersSubscription, type Order } from './orderService';
 import { formatINR } from './productService';
 
 export interface CustomerShippingSummary {
@@ -229,4 +229,26 @@ export async function fetchCustomers(): Promise<CustomerRecord[]> {
   return aggregateCustomersFromOrders(orders);
 }
 
-export { formatINR };
+/**
+ * Subscribes to real-time customer records by listening to order documents in Firestore.
+ * Reuses the shared orders subscription to avoid duplicate collection reads.
+ */
+export function subscribeToCustomers(
+  onData: (customers: CustomerRecord[]) => void,
+  onError?: (error: Error) => void
+): () => void {
+  return subscribeToOrders(
+    (orders) => {
+      try {
+        const customers = aggregateCustomersFromOrders(orders);
+        onData(customers);
+      } catch (err) {
+        console.error('Error aggregating live customers from orders:', err);
+        onError?.(err as Error);
+      }
+    },
+    onError
+  );
+}
+
+export { formatINR, restartOrdersSubscription };

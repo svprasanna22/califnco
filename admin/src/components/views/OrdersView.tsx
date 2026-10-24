@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import {
-  fetchOrders,
+  subscribeToOrders,
+  restartOrdersSubscription,
   createAdminTestOrder,
   removeTestOrder,
   type Order,
@@ -42,20 +43,46 @@ export function OrdersView() {
   // Selected Order for Modal
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const [retryTrigger, setRetryTrigger] = useState(0);
 
-  const loadOrders = useCallback(async () => {
+  const handleManualRefresh = useCallback(() => {
     setLoading(true);
     setError(null);
-    try {
-      const data = await fetchOrders();
-      setOrders(data);
-    } catch (err: unknown) {
-      const msg = (err as Error)?.message || 'Failed to load orders from Cloud Firestore.';
-      setError(msg);
-    } finally {
-      setLoading(false);
-    }
+    restartOrdersSubscription();
+    setRetryTrigger((prev) => prev + 1);
   }, []);
+
+  useEffect(() => {
+    setLoading(true);
+    setError(null);
+
+    const unsub = subscribeToOrders(
+      (data) => {
+        setOrders(data);
+        setLoading(false);
+        setLastUpdated(new Date());
+      },
+      (err) => {
+        setError(err.message || 'Failed to sync orders from Cloud Firestore.');
+        setLoading(false);
+      }
+    );
+
+    return () => {
+      unsub();
+    };
+  }, [retryTrigger]);
+
+  // Keep open order details modal in sync with real-time updates
+  useEffect(() => {
+    if (selectedOrder) {
+      const live = orders.find((o) => o.id === selectedOrder.id);
+      if (live && JSON.stringify(live) !== JSON.stringify(selectedOrder)) {
+        setSelectedOrder(live);
+      }
+    }
+  }, [orders, selectedOrder]);
 
   const handleCreateTestOrder = async () => {
     if (isCreatingTestOrder) return;
@@ -69,7 +96,6 @@ export function OrdersView() {
     try {
       const newOrderId = await createAdminTestOrder(user.uid);
       showSuccess(`Live test order created successfully (ID: ${newOrderId.slice(0, 8)}...).`);
-      await loadOrders();
     } catch (err: unknown) {
       const msg = (err as Error)?.message || 'Failed to create live test order in Cloud Firestore.';
       setError(msg);
@@ -90,17 +116,12 @@ export function OrdersView() {
       await removeTestOrder(order);
       showSuccess(`Test order ${order.orderNumber || order.id} permanently removed.`);
       setConfirmDeleteId(null);
-      await loadOrders();
     } catch (err: unknown) {
       setError((err as Error)?.message || 'Failed to delete test order.');
     } finally {
       setDeletingOrderId(null);
     }
   };
-
-  useEffect(() => {
-    loadOrders();
-  }, [loadOrders]);
 
   const showSuccess = (msg: string) => {
     setSuccessMessage(msg);
@@ -114,12 +135,6 @@ export function OrdersView() {
 
   const handleOrderUpdated = async () => {
     showSuccess('Order updated successfully.');
-    await loadOrders();
-    if (selectedOrder) {
-      // Re-sync current modal view
-      const updated = orders.find((o) => o.id === selectedOrder.id);
-      if (updated) setSelectedOrder(updated);
-    }
   };
 
   // Filtered orders list
@@ -200,12 +215,12 @@ export function OrdersView() {
           <div style={{ flex: 1 }}>
             <div>{error}</div>
             <button
-              onClick={loadOrders}
+              onClick={handleManualRefresh}
               className="btn-secondary"
               style={{ marginTop: 8, height: 28, padding: '0 10px', fontSize: 11 }}
             >
               <RefreshIcon style={{ width: 12, height: 12 }} />
-              <span>Retry Firestore Query</span>
+              <span>Retry Connection</span>
             </button>
           </div>
         </div>
@@ -218,13 +233,25 @@ export function OrdersView() {
           style={{ flexWrap: 'wrap', gap: 16, alignItems: 'center' }}
         >
           <div>
-            <h2 className="section-panel-title">Customer Orders & Installations</h2>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <h2 className="section-panel-title">Customer Orders & Installations</h2>
+              <span className="live-badge" title="Live streaming order events from Cloud Firestore">
+                <span className="live-dot" />
+                LIVE SYNC
+              </span>
+            </div>
             <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 4 }}>
               Live customer purifier deliveries and field technician installation lifecycle.
             </p>
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            {lastUpdated && (
+              <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                Live as of {lastUpdated.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+              </span>
+            )}
+
             <button
               onClick={handleCreateTestOrder}
               className="btn-secondary"
@@ -240,14 +267,14 @@ export function OrdersView() {
               <span>Create Live Test Order</span>
             </button>
             <button
-              onClick={loadOrders}
+              onClick={handleManualRefresh}
               className="btn-secondary"
               disabled={loading}
-              title="Refresh orders from Firestore"
-              aria-label="Refresh orders"
+              title="Re-sync orders from Firestore"
+              aria-label="Re-sync orders"
             >
               <RefreshIcon style={{ width: 14, height: 14 }} className={loading ? 'animate-spin' : ''} />
-              <span>Refresh</span>
+              <span>Re-sync</span>
             </button>
           </div>
         </div>

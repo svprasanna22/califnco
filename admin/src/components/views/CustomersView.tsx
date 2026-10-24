@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import {
-  fetchCustomers,
+  subscribeToCustomers,
+  restartOrdersSubscription,
   formatINR,
   type CustomerRecord,
 } from '../../services/customerService';
@@ -36,30 +37,47 @@ export function CustomersView() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [copiedUid, setCopiedUid] = useState<string | null>(null);
 
-  const loadCustomers = useCallback(async (isRefresh = false) => {
-    if (isRefresh) {
-      setRefreshing(true);
-    } else {
-      setLoading(true);
-    }
-    setError(null);
+  const [retryTrigger, setRetryTrigger] = useState(0);
 
-    try {
-      const data = await fetchCustomers();
-      setCustomers(data);
-      setLastUpdated(new Date());
-    } catch (err: unknown) {
-      const msg = (err as Error)?.message || 'Failed to load customer records from Cloud Firestore.';
-      setError(msg);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
+  const handleManualRefresh = useCallback(() => {
+    setRefreshing(true);
+    setError(null);
+    restartOrdersSubscription();
+    setRetryTrigger((prev) => prev + 1);
   }, []);
 
   useEffect(() => {
-    loadCustomers();
-  }, [loadCustomers]);
+    setLoading(true);
+    setError(null);
+
+    const unsub = subscribeToCustomers(
+      (data) => {
+        setCustomers(data);
+        setLoading(false);
+        setRefreshing(false);
+        setLastUpdated(new Date());
+      },
+      (err) => {
+        setError(err.message || 'Failed to sync customer records from Cloud Firestore.');
+        setLoading(false);
+        setRefreshing(false);
+      }
+    );
+
+    return () => {
+      unsub();
+    };
+  }, [retryTrigger]);
+
+  // Keep open customer details modal in sync with real-time updates
+  useEffect(() => {
+    if (selectedCustomer) {
+      const live = customers.find((c) => c.uid === selectedCustomer.uid);
+      if (live && JSON.stringify(live) !== JSON.stringify(selectedCustomer)) {
+        setSelectedCustomer(live);
+      }
+    }
+  }, [customers, selectedCustomer]);
 
   const handleCopyUid = (uid: string, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -179,6 +197,10 @@ export function CustomersView() {
             <h1 style={{ fontSize: 20, fontWeight: 700, color: '#fff' }}>
               Customer Directory
             </h1>
+            <span className="live-badge" title="Live streaming customer records from Cloud Firestore">
+              <span className="live-dot" />
+              LIVE SYNC
+            </span>
             <span className="status-badge status-info" style={{ fontSize: 11 }}>
               <UsersIcon style={{ width: 12, height: 12 }} />
               {metrics.totalCustomers} Unique Buyer{metrics.totalCustomers === 1 ? '' : 's'}
@@ -192,27 +214,27 @@ export function CustomersView() {
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           {lastUpdated && (
             <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-              Updated {lastUpdated.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+              Live as of {lastUpdated.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
             </span>
           )}
 
           <button
             type="button"
             className="btn-secondary"
-            onClick={() => loadCustomers(true)}
+            onClick={handleManualRefresh}
             disabled={loading || refreshing}
             style={{ height: 38, fontSize: 13 }}
-            title="Refresh customer profiles from Cloud Firestore"
+            title="Re-sync customer profiles from Cloud Firestore"
           >
             {refreshing ? (
               <>
                 <SpinnerIcon style={{ width: 15, height: 15 }} />
-                <span>Refreshing...</span>
+                <span>Syncing...</span>
               </>
             ) : (
               <>
                 <RefreshIcon style={{ width: 15, height: 15 }} />
-                <span>Refresh</span>
+                <span>Re-sync</span>
               </>
             )}
           </button>
@@ -242,10 +264,10 @@ export function CustomersView() {
           <button
             type="button"
             className="btn-secondary"
-            onClick={() => loadCustomers(true)}
+            onClick={handleManualRefresh}
             style={{ height: 32, padding: '0 12px', fontSize: 12, borderColor: 'rgba(244, 63, 94, 0.4)' }}
           >
-            Retry
+            Retry Connection
           </button>
         </div>
       )}

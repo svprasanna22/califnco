@@ -1,12 +1,14 @@
 import { useState, useEffect, useCallback } from 'react';
 import {
-  fetchProducts,
+  subscribeToProducts,
+  restartProductsSubscription,
   formatINR,
   getStockStatus,
   type Product,
 } from '../../services/productService';
 import {
-  fetchOrders,
+  subscribeToOrders,
+  restartOrdersSubscription,
   type Order,
   type OrderFulfillmentStatus,
 } from '../../services/orderService';
@@ -35,37 +37,60 @@ export function DashboardView({ onNavigate }: DashboardViewProps) {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const [retryTrigger, setRetryTrigger] = useState(0);
 
-  const loadData = useCallback(async (isRefresh = false) => {
-    if (isRefresh) {
-      setRefreshing(true);
-    } else {
-      setLoading(true);
-    }
+  const handleManualRefresh = useCallback(() => {
+    setRefreshing(true);
     setError(null);
-
-    try {
-      // Parallel fetch of live Firestore products and orders
-      const [fetchedProducts, fetchedOrders] = await Promise.all([
-        fetchProducts(),
-        fetchOrders(),
-      ]);
-
-      setProducts(fetchedProducts);
-      setOrders(fetchedOrders);
-      setLastUpdated(new Date());
-    } catch (err: unknown) {
-      const msg = (err as Error)?.message || 'Failed to load live data from Cloud Firestore.';
-      setError(msg);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
+    restartProductsSubscription();
+    restartOrdersSubscription();
+    setRetryTrigger((prev) => prev + 1);
   }, []);
 
   useEffect(() => {
-    loadData();
-  }, [loadData]);
+    let productsLoaded = false;
+    let ordersLoaded = false;
+    setError(null);
+
+    const checkInitialLoad = () => {
+      if (productsLoaded && ordersLoaded) {
+        setLoading(false);
+        setRefreshing(false);
+        setLastUpdated(new Date());
+      }
+    };
+
+    const unsubProducts = subscribeToProducts(
+      (newProducts) => {
+        setProducts(newProducts);
+        productsLoaded = true;
+        checkInitialLoad();
+      },
+      (err) => {
+        setError(err.message || 'Failed to sync live products from Cloud Firestore.');
+        setLoading(false);
+        setRefreshing(false);
+      }
+    );
+
+    const unsubOrders = subscribeToOrders(
+      (newOrders) => {
+        setOrders(newOrders);
+        ordersLoaded = true;
+        checkInitialLoad();
+      },
+      (err) => {
+        setError(err.message || 'Failed to sync live orders from Cloud Firestore.');
+        setLoading(false);
+        setRefreshing(false);
+      }
+    );
+
+    return () => {
+      unsubProducts();
+      unsubOrders();
+    };
+  }, [retryTrigger]);
 
   // ==========================================
   // METRICS CALCULATIONS
@@ -366,17 +391,9 @@ export function DashboardView({ onNavigate }: DashboardViewProps) {
             <h1 style={{ fontSize: 20, fontWeight: 700, color: '#fff' }}>
               Operations Overview
             </h1>
-            <span className="status-badge status-success" style={{ fontSize: 11 }}>
-              <span
-                style={{
-                  width: 6,
-                  height: 6,
-                  borderRadius: '50%',
-                  background: 'var(--emerald-primary)',
-                  display: 'inline-block',
-                }}
-              />
-              Live Telemetry
+            <span className="live-badge" title="Live streaming real-time changes from Cloud Firestore">
+              <span className="live-dot" />
+              LIVE SYNC
             </span>
           </div>
           <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 4 }}>
@@ -387,27 +404,27 @@ export function DashboardView({ onNavigate }: DashboardViewProps) {
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           {lastUpdated && (
             <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-              Updated {lastUpdated.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+              Live as of {lastUpdated.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
             </span>
           )}
 
           <button
             type="button"
             className="btn-secondary"
-            onClick={() => loadData(true)}
+            onClick={handleManualRefresh}
             disabled={loading || refreshing}
             style={{ height: 38, fontSize: 13 }}
-            title="Refresh dashboard metrics from Cloud Firestore"
+            title="Re-sync subscriptions with Cloud Firestore"
           >
             {refreshing ? (
               <>
                 <SpinnerIcon style={{ width: 15, height: 15 }} />
-                <span>Refreshing...</span>
+                <span>Syncing...</span>
               </>
             ) : (
               <>
                 <RefreshIcon style={{ width: 15, height: 15 }} />
-                <span>Refresh</span>
+                <span>Re-sync</span>
               </>
             )}
           </button>
@@ -437,10 +454,10 @@ export function DashboardView({ onNavigate }: DashboardViewProps) {
           <button
             type="button"
             className="btn-secondary"
-            onClick={() => loadData(true)}
-            style={{ height: 32, padding: '0 12px', fontSize: 12, borderColor: 'rgba(244, 63, 94, 0.4)' }}
+            onClick={handleManualRefresh}
+            style={{ fontSize: 12, height: 32 }}
           >
-            Retry
+            Retry Connection
           </button>
         </div>
       )}

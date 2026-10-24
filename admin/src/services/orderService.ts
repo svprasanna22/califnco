@@ -9,6 +9,8 @@ import {
   serverTimestamp,
   query,
   orderBy,
+  onSnapshot,
+  type Unsubscribe,
   type Timestamp,
   type FieldValue,
 } from 'firebase/firestore';
@@ -165,6 +167,177 @@ export async function fetchOrders(): Promise<Order[]> {
     console.error('Error fetching orders from Firestore:', error);
     throw new Error(getFriendlyFirestoreErrorMessage(error));
   }
+}
+
+interface OrderSubscriber {
+  onData: (orders: Order[]) => void;
+  onError?: (error: Error) => void;
+}
+
+let activeOrdersUnsub: Unsubscribe | null = null;
+let cachedOrders: Order[] | null = null;
+let ordersCleanupTimer: ReturnType<typeof setTimeout> | null = null;
+const orderSubscribers = new Set<OrderSubscriber>();
+
+function startOrdersListener() {
+  if (activeOrdersUnsub) return;
+
+  const ordersRef = collection(db, ORDERS_COLLECTION);
+  const q = query(ordersRef, orderBy('createdAt', 'desc'));
+
+  const handleSnapshot = (snapshotDocs: Array<{ id: string; data: () => any }>) => {
+    const list: Order[] = snapshotDocs.map((docSnap) => ({
+      id: docSnap.id,
+      ...(docSnap.data() as Omit<Order, 'id'>),
+    }));
+    cachedOrders = list;
+    orderSubscribers.forEach((sub) => {
+      try {
+        sub.onData(list);
+      } catch (err) {
+        console.error('Error in order subscriber callback:', err);
+      }
+    });
+  };
+
+  const handleListenerError = (error: unknown) => {
+    console.error('Error in orders onSnapshot listener:', error);
+    const friendlyError = new Error(getFriendlyFirestoreErrorMessage(error));
+    orderSubscribers.forEach((sub) => {
+      try {
+        sub.onError?.(friendlyError);
+      } catch (err) {
+        console.error('Error in order subscriber error callback:', err);
+      }
+    });
+  };
+
+  try {
+    activeOrdersUnsub = onSnapshot(
+      q,
+      (snapshot) => {
+        handleSnapshot(snapshot.docs);
+      },
+      (error) => {
+        console.warn('Ordered orders snapshot failed, falling back to unordered listener:', error);
+        if (activeOrdersUnsub) {
+          activeOrdersUnsub();
+          activeOrdersUnsub = null;
+        }
+        try {
+          activeOrdersUnsub = onSnapshot(
+            ordersRef,
+            (fallbackSnap) => {
+              handleSnapshot(fallbackSnap.docs);
+            },
+            (fallbackError) => {
+              handleListenerError(fallbackError);
+            }
+          );
+        } catch (innerError) {
+          handleListenerError(innerError);
+        }
+      }
+    );
+  } catch (initialError) {
+    handleListenerError(initialError);
+  }
+}
+
+function stopOrdersListenerImmediate() {
+  if (ordersCleanupTimer) {
+    clearTimeout(ordersCleanupTimer);
+    ordersCleanupTimer = null;
+  }
+  if (activeOrdersUnsub) {
+    activeOrdersUnsub();
+    activeOrdersUnsub = null;
+  }
+}
+
+/**
+ * Subscribes to real-time changes in the orders collection using Firestore onSnapshot.
+ * Employs a shared, reference-counted listener with a 10s retention grace period to avoid
+ * duplicate listeners and redundant collection reads across admin view switches (Spark plan).
+ *
+ * @param onData Callback receiving updated orders array
+ * @param onError Optional callback receiving Firestore errors
+ * @returns Unsubscribe function to release the listener on unmount
+ */
+export function subscribeToOrders(
+  onData: (orders: Order[]) => void,
+  onError?: (error: Error) => void
+): () => void {
+  const subscriber: OrderSubscriber = { onData, onError };
+  orderSubscribers.add(subscriber);
+
+  if (ordersCleanupTimer) {
+    clearTimeout(ordersCleanupTimer);
+    ordersCleanupTimer = null;
+  }
+
+  // Deliver cached snapshot immediately if available to eliminate UI blank flash
+  if (cachedOrders !== null) {
+    try {
+      onData(cachedOrders);
+    } catch (e) {
+      console.error('Error delivering cached orders:', e);
+    }
+  }
+
+  if (!activeOrdersUnsub) {
+    startOrdersListener();
+  }
+
+  return () => {
+    orderSubscribers.delete(subscriber);
+    if (orderSubscribers.size === 0) {
+      // 10s grace period allows instant tab switching between Dashboard, Orders, Customers without extra Firestore reads
+      ordersCleanupTimer = setTimeout(() => {
+        if (orderSubscribers.size === 0) {
+          stopOrdersListenerImmediate();
+        }
+      }, 10000);
+    }
+  };
+}
+
+/**
+ * Forces a clean restart of the real-time orders listener (used for retry buttons)
+ */
+export function restartOrdersSubscription(): void {
+  stopOrdersListenerImmediate();
+  if (orderSubscribers.size > 0) {
+    startOrdersListener();
+  }
+}
+
+/**
+ * Subscribes to real-time updates for a single order document
+ */
+export function subscribeToOrder(
+  orderId: string,
+  onData: (order: Order | null) => void,
+  onError?: (error: Error) => void
+): () => void {
+  const docRef = doc(db, ORDERS_COLLECTION, orderId);
+  return onSnapshot(
+    docRef,
+    (snap) => {
+      if (!snap.exists()) {
+        onData(null);
+      } else {
+        onData({
+          id: snap.id,
+          ...(snap.data() as Omit<Order, 'id'>),
+        });
+      }
+    },
+    (err) => {
+      console.error(`Error subscribing to order ${orderId}:`, err);
+      onError?.(new Error(getFriendlyFirestoreErrorMessage(err)));
+    }
+  );
 }
 
 /**

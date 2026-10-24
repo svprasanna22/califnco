@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import {
-  fetchProducts,
+  subscribeToProducts,
+  restartProductsSubscription,
   updateProductStock,
   formatINR,
   getStockStatus,
@@ -42,30 +43,37 @@ export function InventoryView() {
   const [isModalOpen, setIsModalOpen] = useState<boolean>(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  const loadProducts = useCallback(async (isRefresh = false) => {
-    if (isRefresh) {
-      setRefreshing(true);
-    } else {
-      setLoading(true);
-    }
-    setError(null);
+  const [retryTrigger, setRetryTrigger] = useState(0);
 
-    try {
-      const data = await fetchProducts();
-      setProducts(data);
-      setLastUpdated(new Date());
-    } catch (err: unknown) {
-      const msg = (err as Error)?.message || 'Failed to load products from Cloud Firestore.';
-      setError(msg);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
+  const handleManualRefresh = useCallback(() => {
+    setRefreshing(true);
+    setError(null);
+    restartProductsSubscription();
+    setRetryTrigger((prev) => prev + 1);
   }, []);
 
   useEffect(() => {
-    loadProducts();
-  }, [loadProducts]);
+    setLoading(true);
+    setError(null);
+
+    const unsub = subscribeToProducts(
+      (data) => {
+        setProducts(data);
+        setLoading(false);
+        setRefreshing(false);
+        setLastUpdated(new Date());
+      },
+      (err) => {
+        setError(err.message || 'Failed to sync products from Cloud Firestore.');
+        setLoading(false);
+        setRefreshing(false);
+      }
+    );
+
+    return () => {
+      unsub();
+    };
+  }, [retryTrigger]);
 
   const showSuccess = (msg: string) => {
     setSuccessMessage(msg);
@@ -225,9 +233,9 @@ export function InventoryView() {
             <h1 style={{ fontSize: 20, fontWeight: 700, color: '#fff' }}>
               Inventory & Stock Management
             </h1>
-            <span className="status-badge status-info" style={{ fontSize: 11 }}>
-              <InventoryIcon style={{ width: 12, height: 12 }} />
-              Live Warehouse Sync
+            <span className="live-badge" title="Live streaming real-time inventory from Cloud Firestore">
+              <span className="live-dot" />
+              LIVE SYNC
             </span>
           </div>
           <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 4 }}>
@@ -238,27 +246,27 @@ export function InventoryView() {
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           {lastUpdated && (
             <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-              Updated {lastUpdated.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+              Live as of {lastUpdated.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
             </span>
           )}
 
           <button
             type="button"
             className="btn-secondary"
-            onClick={() => loadProducts(true)}
+            onClick={handleManualRefresh}
             disabled={loading || refreshing}
             style={{ height: 38, fontSize: 13 }}
-            title="Refresh product stock from Cloud Firestore"
+            title="Re-sync product stock from Cloud Firestore"
           >
             {refreshing ? (
               <>
                 <SpinnerIcon style={{ width: 15, height: 15 }} />
-                <span>Refreshing...</span>
+                <span>Syncing...</span>
               </>
             ) : (
               <>
                 <RefreshIcon style={{ width: 15, height: 15 }} />
-                <span>Refresh</span>
+                <span>Re-sync</span>
               </>
             )}
           </button>
@@ -308,10 +316,10 @@ export function InventoryView() {
           <button
             type="button"
             className="btn-secondary"
-            onClick={() => loadProducts(true)}
+            onClick={handleManualRefresh}
             style={{ height: 32, padding: '0 12px', fontSize: 12, borderColor: 'rgba(244, 63, 94, 0.4)' }}
           >
-            Retry
+            Retry Connection
           </button>
         </div>
       )}
