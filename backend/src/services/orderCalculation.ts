@@ -78,14 +78,17 @@ export function validateShippingAddress(addr: any): ShippingAddressInput {
     throw new Error('A valid 6-digit Indian PIN code is required (e.g. 560001).');
   }
 
-  return {
+  const cleaned: ShippingAddressInput = {
     street: addr.street.trim(),
-    landmark: typeof addr.landmark === 'string' && addr.landmark.trim() ? addr.landmark.trim() : undefined,
+    ...(typeof addr.landmark === 'string' && addr.landmark.trim()
+      ? { landmark: addr.landmark.trim() }
+      : {}),
     city: addr.city.trim(),
     state: addr.state.trim(),
     postalCode: addr.postalCode.trim(),
     country: typeof addr.country === 'string' && addr.country.trim() ? addr.country.trim() : 'India',
   };
+  return cleaned;
 }
 
 export function calculateAuthoritativeTotals(
@@ -120,15 +123,18 @@ export function calculateAuthoritativeTotals(
     const itemTotal = price * item.quantity;
     subtotal += itemTotal;
 
-    lineItems.push({
+    const lineItem: OrderLineItem = {
       productId: product.id,
       name: product.name,
       category: product.category,
       price,
       quantity: item.quantity,
       total: itemTotal,
-      imageUrl: product.imageUrl,
-    });
+      ...(product.imageUrl && typeof product.imageUrl === 'string' && product.imageUrl.trim()
+        ? { imageUrl: product.imageUrl.trim() }
+        : {}),
+    };
+    lineItems.push(lineItem);
   }
 
   const tax = Math.round(subtotal * GST_RATE);
@@ -152,4 +158,41 @@ export function generateOrderNumber(): string {
   const timePart = Date.now().toString(36).toUpperCase().slice(-4);
   const randomPart = Math.floor(1000 + Math.random() * 9000);
   return `ORD-${timePart}-${randomPart}`;
+}
+
+/**
+ * Recursively sanitizes any payload destined for Firestore by omitting keys with undefined values.
+ * Preserves null, numbers, strings, booleans, arrays, Dates, and Firestore FieldValues.
+ */
+export function sanitizeForFirestore<T>(data: T): T {
+  if (data === null || data === undefined) {
+    return data;
+  }
+
+  if (Array.isArray(data)) {
+    return data
+      .filter((item) => item !== undefined)
+      .map((item) => sanitizeForFirestore(item)) as unknown as T;
+  }
+
+  if (typeof data === 'object') {
+    // Preserve FieldValue (e.g. serverTimestamp) or Date instances
+    if (
+      data.constructor &&
+      data.constructor.name !== 'Object' &&
+      typeof (data as any).isEqual !== 'function'
+    ) {
+      return data;
+    }
+
+    const cleanedObj: Record<string, any> = {};
+    for (const [key, value] of Object.entries(data)) {
+      if (value !== undefined) {
+        cleanedObj[key] = sanitizeForFirestore(value);
+      }
+    }
+    return cleanedObj as T;
+  }
+
+  return data;
 }

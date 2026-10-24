@@ -7,9 +7,10 @@ import {
   validateShippingAddress,
   calculateAuthoritativeTotals,
   generateOrderNumber,
+  sanitizeForFirestore,
 } from '../services/orderCalculation';
+import { getAuthoritativeCatalogRecords } from '../services/catalogService';
 import type {
-  ProductCatalogRecord,
   OrderDocument,
   OrderDealerInfo,
 } from '../types';
@@ -17,17 +18,23 @@ import type {
 export const paymentRouter = Router();
 
 /**
- * Middleware: Verifies Firebase ID Token from Authorization header
+ * Middleware: Verifies Firebase ID Token from Authorization header or query parameter
  */
 export async function authenticateFirebaseUser(req: Request, res: Response, next: Function) {
+  let idToken: string | undefined;
+
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    idToken = authHeader.split('Bearer ')[1].trim();
+  } else if (typeof req.query.token === 'string' && req.query.token.trim()) {
+    idToken = req.query.token.trim();
+  }
+
+  if (!idToken) {
     return res.status(401).json({
       error: 'Unauthorized: Missing or invalid Authorization header. Firebase ID token required.',
     });
   }
-
-  const idToken = authHeader.split('Bearer ')[1].trim();
 
   try {
     const decodedToken = await auth.verifyIdToken(idToken);
@@ -43,15 +50,198 @@ export async function authenticateFirebaseUser(req: Request, res: Response, next
 }
 
 /**
+ * Helper to verify dealer status
+ */
+async function getVerifiedDealerInfo(
+  uid: string,
+  orderType: string | undefined
+): Promise<OrderDealerInfo | undefined> {
+  if (orderType !== 'dealer') {
+    return undefined;
+  }
+
+  const directDealer = await db.collection('dealers').doc(uid).get();
+  let dealerSnap = directDealer.exists ? directDealer : null;
+
+  if (!dealerSnap) {
+    const qUser = await db.collection('dealers').where('userId', '==', uid).limit(1).get();
+    if (!qUser.empty) {
+      dealerSnap = qUser.docs[0];
+    } else {
+      const qUid = await db.collection('dealers').where('uid', '==', uid).limit(1).get();
+      if (!qUid.empty) dealerSnap = qUid.docs[0];
+    }
+  }
+
+  if (!dealerSnap || !dealerSnap.exists) {
+    throw new Error('Verified dealer profile not found for this account. Contact Califnco administration.');
+  }
+
+  const dData = dealerSnap.data() || {};
+  if (dData.status !== 'active') {
+    throw new Error(
+      `Dealer profile is ${dData.status || 'not active'}. Only approved active dealers can place orders.`
+    );
+  }
+
+  return {
+    id: dealerSnap.id,
+    dealerCode: String(dData.dealerCode || 'DLR-UNASSIGNED'),
+    businessName: String(dData.businessName || 'Authorized Dealership'),
+    tier: String(dData.tier || 'silver'),
+  };
+}
+
+/**
+ * POST /api/payments/create-cod-order
+ *
+ * Places an authenticated Cash on Delivery order via Render backend.
+ * Replaces undeployed Firebase Cloud Function on Spark plan.
+ * - Authenticated caller required (Firebase ID token).
+ * - Authoritative pricing and inventory check.
+ * - Atomic stock decrement inside a Firestore transaction.
+ * - Creates order in 'orders' collection.
+ */
+paymentRouter.post(
+  '/create-cod-order',
+  authenticateFirebaseUser,
+  async (req: Request, res: Response) => {
+    try {
+      const user = (req as any).user;
+      const { items, shippingAddress, customerInfo, orderType } = req.body;
+
+      // 1. Validate payload structure
+      let validatedItems;
+      let validatedAddress;
+      try {
+        validatedItems = validateOrderItems(items);
+        validatedAddress = validateShippingAddress(shippingAddress);
+      } catch (valErr: any) {
+        return res.status(400).json({ error: valErr.message });
+      }
+
+      // 2. Fetch authoritative product records
+      let catalogMap;
+      try {
+        catalogMap = await getAuthoritativeCatalogRecords(
+          validatedItems.map((i) => i.productId)
+        );
+      } catch (catErr: any) {
+        return res.status(400).json({ error: catErr.message });
+      }
+
+      // 3. Calculate authoritative pricing
+      let calculation;
+      try {
+        calculation = calculateAuthoritativeTotals(validatedItems, catalogMap);
+      } catch (calcErr: any) {
+        return res.status(400).json({ error: calcErr.message });
+      }
+
+      const { lineItems, pricing } = calculation;
+
+      // 4. Verify dealer status if ordering as dealer
+      let dealerInfo: OrderDealerInfo | undefined;
+      try {
+        dealerInfo = await getVerifiedDealerInfo(user.uid, orderType);
+      } catch (dealerErr: any) {
+        return res.status(403).json({ error: dealerErr.message });
+      }
+
+      // 5. Atomic Firestore Transaction: Verify stock, decrement stock, create order
+      const orderNumber = generateOrderNumber();
+      const orderRef = db.collection('orders').doc();
+
+      await db.runTransaction(async (transaction) => {
+        // Read and verify live stock
+        for (const item of lineItems) {
+          const prodRef = db.collection('products').doc(item.productId);
+          const pSnap = await transaction.get(prodRef);
+          if (pSnap.exists) {
+            const currentStock = Number(pSnap.data()?.stock ?? 0);
+            if (currentStock < item.quantity) {
+              throw new Error(
+                `Insufficient stock for "${item.name}". Only ${currentStock} available, but ${item.quantity} requested.`
+              );
+            }
+            transaction.update(prodRef, {
+              stock: currentStock - item.quantity,
+              updatedAt: FieldValue.serverTimestamp(),
+            });
+          }
+        }
+
+        const orderData: OrderDocument = {
+          orderNumber,
+          isTestOrder: config.isTestMode,
+          orderType: orderType === 'dealer' ? 'dealer' : 'customer',
+          ...(dealerInfo ? { dealer: dealerInfo } : {}),
+          customer: {
+            uid: user.uid,
+            email: user.email || 'customer@califnco.com',
+            name: (customerInfo?.name && customerInfo.name.trim()) || (dealerInfo ? dealerInfo.businessName : 'Valued Customer'),
+            phone: (customerInfo?.phone && customerInfo.phone.trim()) || '+91 99999 99999',
+          },
+          shippingAddress: {
+            street: validatedAddress.street,
+            ...(validatedAddress.landmark?.trim()
+              ? { landmark: validatedAddress.landmark.trim() }
+              : {}),
+            city: validatedAddress.city,
+            state: validatedAddress.state,
+            postalCode: validatedAddress.postalCode,
+            country: validatedAddress.country || 'India',
+          },
+          items: lineItems,
+          pricing,
+          payment: {
+            method: 'cash_on_delivery',
+            status: 'cash_on_delivery',
+            transactionId: null,
+            isTestMode: config.isTestMode,
+            notes: 'Cash on Delivery. Collect payment on doorstep unboxing and TDS installation.',
+          },
+          fulfillment: {
+            status: 'pending',
+            notes: 'Cash on Delivery order confirmed. Technician unboxing & installation scheduled.',
+          },
+          createdAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+          createdBy: user.uid,
+          updatedBy: user.uid,
+        };
+
+        const sanitizedPayload = sanitizeForFirestore(orderData);
+        transaction.set(orderRef, sanitizedPayload);
+      });
+
+      return res.status(200).json({
+        success: true,
+        orderId: orderRef.id,
+        orderNumber,
+        totalAmount: pricing.totalAmount,
+        subtotal: pricing.subtotal,
+        tax: pricing.tax,
+        itemCount: lineItems.length,
+        paymentMethod: 'cash_on_delivery',
+      });
+    } catch (error: any) {
+      console.error('Error in create-cod-order:', error);
+      return res.status(500).json({
+        error: error?.message || 'Failed to place Cash on Delivery order.',
+      });
+    }
+  }
+);
+
+/**
  * POST /api/payments/create-razorpay-order
  *
- * Security & Accuracy Guarantees:
- * 1. Authenticated user required (verified via Firebase ID token).
- * 2. Ignores any client-provided price, tax, or total. Re-evaluates catalog authoritatively.
- * 3. Enforces integer amount in paise (1 INR = 100 paise).
- * 4. Verifies dealer status if orderType === 'dealer'.
- * 5. Creates a pending order record in Firestore before opening client checkout.
- * 6. Returns Razorpay Order ID & Key ID. NEVER returns Key Secret.
+ * Creates a real Razorpay Order via the official Razorpay SDK.
+ * - Authenticated user required (Firebase ID token).
+ * - Authoritative pricing.
+ * - Stores pending order in Firestore.
+ * - Returns Razorpay Order ID & Key ID (NEVER returns Key Secret).
  */
 paymentRouter.post(
   '/create-razorpay-order',
@@ -71,28 +261,14 @@ paymentRouter.post(
         return res.status(400).json({ error: valErr.message });
       }
 
-      // 2. Fetch authoritative product records from Firestore
-      const productIds = validatedItems.map((i) => i.productId);
-      const productSnapshots = await Promise.all(
-        productIds.map((id) => db.collection('products').doc(id).get())
-      );
-
-      const catalogMap = new Map<string, ProductCatalogRecord>();
-      for (const snap of productSnapshots) {
-        if (!snap.exists) {
-          return res.status(400).json({
-            error: `Product with ID "${snap.id}" was not found in the catalog.`,
-          });
-        }
-        const data = snap.data() || {};
-        catalogMap.set(snap.id, {
-          id: snap.id,
-          name: String(data.name || 'Califnco Purifier'),
-          category: String(data.category || 'ro-purifiers'),
-          price: Number(data.price || 0),
-          stock: Number(data.stock ?? 0),
-          imageUrl: typeof data.imageUrl === 'string' ? data.imageUrl : undefined,
-        });
+      // 2. Fetch authoritative product catalog
+      let catalogMap;
+      try {
+        catalogMap = await getAuthoritativeCatalogRecords(
+          validatedItems.map((i) => i.productId)
+        );
+      } catch (catErr: any) {
+        return res.status(400).json({ error: catErr.message });
       }
 
       // 3. Calculate authoritative pricing & paise
@@ -106,40 +282,11 @@ paymentRouter.post(
       const { lineItems, pricing, amountPaise } = calculation;
 
       // 4. Verify dealer status if ordering as dealer
-      let dealerInfo: OrderDealerInfo | undefined = undefined;
-      if (orderType === 'dealer') {
-        const directDealer = await db.collection('dealers').doc(user.uid).get();
-        let dealerSnap = directDealer.exists ? directDealer : null;
-
-        if (!dealerSnap) {
-          const qUser = await db.collection('dealers').where('userId', '==', user.uid).limit(1).get();
-          if (!qUser.empty) {
-            dealerSnap = qUser.docs[0];
-          } else {
-            const qUid = await db.collection('dealers').where('uid', '==', user.uid).limit(1).get();
-            if (!qUid.empty) dealerSnap = qUid.docs[0];
-          }
-        }
-
-        if (!dealerSnap || !dealerSnap.exists) {
-          return res.status(403).json({
-            error: 'Verified dealer profile not found for this account. Contact Califnco administration.',
-          });
-        }
-
-        const dData = dealerSnap.data() || {};
-        if (dData.status !== 'active') {
-          return res.status(403).json({
-            error: `Dealer profile is ${dData.status || 'not active'}. Only approved active dealers can place orders.`,
-          });
-        }
-
-        dealerInfo = {
-          id: dealerSnap.id,
-          dealerCode: String(dData.dealerCode || 'DLR-UNASSIGNED'),
-          businessName: String(dData.businessName || 'Authorized Dealership'),
-          tier: String(dData.tier || 'silver'),
-        };
+      let dealerInfo: OrderDealerInfo | undefined;
+      try {
+        dealerInfo = await getVerifiedDealerInfo(user.uid, orderType);
+      } catch (dealerErr: any) {
+        return res.status(403).json({ error: dealerErr.message });
       }
 
       // 5. Create Razorpay Order via official SDK
@@ -166,14 +313,23 @@ paymentRouter.post(
         orderNumber,
         isTestOrder: config.isTestMode,
         orderType: orderType === 'dealer' ? 'dealer' : 'customer',
-        ... (dealerInfo ? { dealer: dealerInfo } : {}),
+        ...(dealerInfo ? { dealer: dealerInfo } : {}),
         customer: {
           uid: user.uid,
           email: user.email || 'customer@califnco.com',
-          name: customerInfo?.name || (dealerInfo ? dealerInfo.businessName : 'Valued Customer'),
-          phone: customerInfo?.phone || '+91 99999 99999',
+          name: (customerInfo?.name && customerInfo.name.trim()) || (dealerInfo ? dealerInfo.businessName : 'Valued Customer'),
+          phone: (customerInfo?.phone && customerInfo.phone.trim()) || '+91 99999 99999',
         },
-        shippingAddress: validatedAddress,
+        shippingAddress: {
+          street: validatedAddress.street,
+          ...(validatedAddress.landmark?.trim()
+            ? { landmark: validatedAddress.landmark.trim() }
+            : {}),
+          city: validatedAddress.city,
+          state: validatedAddress.state,
+          postalCode: validatedAddress.postalCode,
+          country: validatedAddress.country || 'India',
+        },
         items: lineItems,
         pricing,
         payment: {
@@ -194,7 +350,8 @@ paymentRouter.post(
         updatedBy: user.uid,
       };
 
-      await orderRef.set(orderData);
+      const sanitizedPayload = sanitizeForFirestore(orderData);
+      await orderRef.set(sanitizedPayload);
 
       // 7. Return Razorpay parameters for client checkout (NEVER returns key_secret)
       return res.status(200).json({
@@ -225,7 +382,7 @@ paymentRouter.post(
  * 3. Verifies customer ownership (order.customer.uid === req.user.uid).
  * 4. Fetches payment record from Razorpay API to verify status, amount, and order_id.
  * 5. Uses idempotency protection: repeated callbacks return success without double-decrementing stock.
- * 6. Atomically updates stock in Firestore and marks order paid.
+ * 6. Atomically checks stock and decrements stock in Firestore transaction, strictly rejecting if insufficient.
  */
 paymentRouter.post(
   '/verify-payment',
@@ -258,7 +415,7 @@ paymentRouter.post(
         });
       }
 
-      // 3. Idempotency Check (Requirement 10)
+      // 3. Idempotency Check
       if (
         orderData.payment.status === 'paid' &&
         orderData.payment.transactionId === razorpayPaymentId
@@ -280,7 +437,7 @@ paymentRouter.post(
         });
       }
 
-      // 5. Cryptographic Signature Verification (Requirement 8)
+      // 5. Cryptographic Signature Verification
       const isSignatureValid = verifyRazorpaySignature(
         razorpayOrderId,
         razorpayPaymentId,
@@ -289,7 +446,6 @@ paymentRouter.post(
       );
 
       if (!isSignatureValid) {
-        // Record failed verification on order
         await orderRef.update({
           'payment.status': 'failed',
           'payment.notes': `Signature verification failed for payment "${razorpayPaymentId}".`,
@@ -302,7 +458,7 @@ paymentRouter.post(
         });
       }
 
-      // 6. Verify Payment Details with Razorpay Gateway API (Requirement 9)
+      // 6. Verify Payment Details with Razorpay Gateway API
       const razorpay = getRazorpayClient();
       let rzpPayment: any;
       try {
@@ -352,17 +508,20 @@ paymentRouter.post(
         });
       }
 
-      // 7. Atomic Firestore Transaction: Decrement stock and mark paid (Requirement 11)
+      // 7. Atomic Firestore Transaction: Check stock, decrement stock, and mark order paid
       await db.runTransaction(async (transaction) => {
-        // Check current stock
         for (const item of orderData.items) {
           const prodRef = db.collection('products').doc(item.productId);
           const pSnap = await transaction.get(prodRef);
           if (pSnap.exists) {
             const currentStock = Number(pSnap.data()?.stock ?? 0);
-            const newStock = Math.max(0, currentStock - item.quantity);
+            if (currentStock < item.quantity) {
+              throw new Error(
+                `Insufficient stock for "${item.name}". Only ${currentStock} available, but ${item.quantity} requested.`
+              );
+            }
             transaction.update(prodRef, {
-              stock: newStock,
+              stock: currentStock - item.quantity,
               updatedAt: FieldValue.serverTimestamp(),
             });
           }
@@ -399,6 +558,231 @@ paymentRouter.post(
     }
   }
 );
+
+/**
+ * GET /api/payments/checkout-web
+ *
+ * Serves a lightweight web checkout page using official Razorpay checkout.js.
+ * Enables real, cryptographically verifiable payments from Expo Go or browsers
+ * without requiring native SDK binary linking.
+ */
+paymentRouter.get('/checkout-web', async (req: Request, res: Response) => {
+  const { orderId } = req.query;
+  if (!orderId || typeof orderId !== 'string') {
+    return res.status(400).send('<h3>Error: Missing orderId parameter.</h3>');
+  }
+
+  try {
+    const orderDoc = await db.collection('orders').doc(orderId).get();
+    if (!orderDoc.exists) {
+      return res.status(404).send('<h3>Error: Order not found.</h3>');
+    }
+
+    const orderData = orderDoc.data() as OrderDocument;
+    if (orderData.payment.status === 'paid') {
+      return res.send(`
+        <html>
+          <head><title>Order Confirmed - Califnco</title><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+          <body style="font-family: sans-serif; background: #0A0F1D; color: #fff; text-align: center; padding: 40px 20px;">
+            <h2 style="color: #10b981;">✓ Order Already Verified & Confirmed</h2>
+            <p>Order <strong>${orderData.orderNumber}</strong> is confirmed.</p>
+            <p style="color: #94a3b8;">You may return to the Califnco app to view your orders.</p>
+          </body>
+        </html>
+      `);
+    }
+
+    const razorpayOrderId = orderData.payment.razorpayOrderId;
+    if (!razorpayOrderId) {
+      return res.status(400).send('<h3>Error: Order does not have an associated Razorpay Order ID.</h3>');
+    }
+
+    const amountPaise = Math.round(orderData.pricing.totalAmount * 100);
+
+    const html = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Califnco Razorpay Test Checkout</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+  <style>
+    body {
+      background: #0A0F1D;
+      color: #f8fafc;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      margin: 0;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 90vh;
+    }
+    .card {
+      background: #0f172a;
+      border: 1px solid rgba(56, 189, 248, 0.2);
+      border-radius: 16px;
+      padding: 32px;
+      max-width: 440px;
+      width: 100%;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    }
+    .badge {
+      display: inline-block;
+      background: rgba(2, 132, 199, 0.2);
+      color: #38bdf8;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 999px;
+      margin-bottom: 16px;
+      letter-spacing: 0.5px;
+    }
+    h2 { margin: 0 0 8px 0; font-size: 20px; font-weight: 700; }
+    p { margin: 0 0 20px 0; color: #94a3b8; font-size: 14px; line-height: 1.5; }
+    .amount-box {
+      background: #1e293b;
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .amount-label { color: #94a3b8; font-size: 13px; }
+    .amount-val { color: #38bdf8; font-size: 22px; font-weight: 800; }
+    .btn {
+      background: #0284c7;
+      color: #fff;
+      border: none;
+      border-radius: 12px;
+      padding: 16px 24px;
+      font-size: 16px;
+      font-weight: 700;
+      width: 100%;
+      cursor: pointer;
+      display: block;
+      box-sizing: border-box;
+      text-align: center;
+      transition: background 0.2s;
+    }
+    .btn:hover { background: #0369a1; }
+    #status-box {
+      margin-top: 16px;
+      padding: 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      display: none;
+    }
+    .test-credentials {
+      background: rgba(30, 41, 59, 0.5);
+      border-radius: 8px;
+      padding: 12px;
+      margin-top: 20px;
+      font-size: 12px;
+      color: #cbd5e1;
+      border-left: 3px solid #38bdf8;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <span class="badge">OFFICIAL RAZORPAY TEST GATEWAY</span>
+    <h2>Califnco Water Technologies</h2>
+    <p>Order #${orderData.orderNumber}</p>
+
+    <div class="amount-box">
+      <span class="amount-label">Total Payable</span>
+      <span class="amount-val">₹${(amountPaise / 100).toLocaleString('en-IN')}</span>
+    </div>
+
+    <button id="pay-btn" class="btn" onclick="openRazorpay()">Proceed to Razorpay Checkout</button>
+    <div id="status-box"></div>
+
+    <div class="test-credentials">
+      <strong>Test Payment Instructions:</strong><br>
+      • <strong>Cards:</strong> Use card <code>4111 1111 1111 1111</code>, any future expiry, CVV <code>123</code>, OTP <code>123456</code>.<br>
+      • <strong>UPI:</strong> Use virtual ID <code>success@razorpay</code>.
+    </div>
+  </div>
+
+  <script>
+    function openRazorpay() {
+      const options = {
+        key: "${config.razorpayKeyId}",
+        amount: ${amountPaise},
+        currency: "INR",
+        name: "Califnco Water Technologies",
+        description: "Order #${orderData.orderNumber}",
+        order_id: "${razorpayOrderId}",
+        prefill: {
+          name: "${(orderData.customer.name || 'Customer').replace(/"/g, '')}",
+          email: "${(orderData.customer.email || 'customer@califnco.com').replace(/"/g, '')}",
+          contact: "${(orderData.customer.phone || '9999999999').replace(/"/g, '')}"
+        },
+        theme: { color: "#0284c7" },
+        handler: async function (response) {
+          const statusBox = document.getElementById('status-box');
+          statusBox.style.display = 'block';
+          statusBox.style.background = 'rgba(56, 189, 248, 0.1)';
+          statusBox.style.color = '#38bdf8';
+          statusBox.innerHTML = 'Verifying cryptographic payment signature with Califnco backend...';
+
+          try {
+            const urlParams = new URLSearchParams(window.location.search);
+            const token = urlParams.get('token');
+            const headers = { 'Content-Type': 'application/json' };
+            if (token) headers['Authorization'] = 'Bearer ' + token;
+
+            const verifyRes = await fetch('/api/payments/verify-payment' + (token ? '?token=' + encodeURIComponent(token) : ''), {
+              method: 'POST',
+              headers: headers,
+              body: JSON.stringify({
+                orderId: "${orderDoc.id}",
+                razorpayOrderId: response.razorpay_order_id,
+                razorpayPaymentId: response.razorpay_payment_id,
+                razorpaySignature: response.razorpay_signature,
+              })
+            });
+            const data = await verifyRes.json();
+            if (verifyRes.ok && data.success) {
+              statusBox.style.background = 'rgba(16, 185, 129, 0.15)';
+              statusBox.style.color = '#10b981';
+              statusBox.innerHTML = '<strong>✓ Payment Verified & Confirmed!</strong><br>Payment ID: ' + response.razorpay_payment_id + '<br>You may now switch back to the Califnco app.';
+              document.getElementById('pay-btn').style.display = 'none';
+            } else {
+              statusBox.style.background = 'rgba(239, 68, 68, 0.15)';
+              statusBox.style.color = '#f87171';
+              statusBox.innerHTML = 'Verification failed: ' + (data.error || 'Unknown error');
+            }
+          } catch (e) {
+            statusBox.style.background = 'rgba(239, 68, 68, 0.15)';
+            statusBox.style.color = '#f87171';
+            statusBox.innerHTML = 'Network error while verifying payment: ' + e.message;
+          }
+        }
+      };
+      const rzp = new Razorpay(options);
+      rzp.on('payment.failed', function (response) {
+        const statusBox = document.getElementById('status-box');
+        statusBox.style.display = 'block';
+        statusBox.style.background = 'rgba(239, 68, 68, 0.15)';
+        statusBox.style.color = '#f87171';
+        statusBox.innerHTML = 'Payment failed: ' + (response.error.description || 'Cancelled');
+      });
+      rzp.open();
+    }
+  </script>
+</body>
+</html>
+    `;
+    return res.send(html);
+  } catch (err: any) {
+    return res.status(500).send(`<h3>Server error: ${err?.message}</h3>`);
+  }
+});
 
 /**
  * POST /api/payments/report-failure

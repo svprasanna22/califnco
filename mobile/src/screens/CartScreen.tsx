@@ -136,12 +136,6 @@ export function CartScreen({
     setCheckoutError(null);
     if (!validateAddress()) return;
 
-    // Direct client orders are disabled on Spark free plan to protect price and inventory integrity
-    if (!IS_BACKEND_DEPLOYED) {
-      setCheckoutError('Checkout is not available yet. No order has been placed.');
-      return;
-    }
-
     setIsSubmitting(true);
     try {
       const result = await submitOrderToBackend({
@@ -151,7 +145,7 @@ export function CartScreen({
         })),
         shippingAddress: {
           street: street.trim(),
-          landmark: landmark.trim() || undefined,
+          ...(landmark.trim() ? { landmark: landmark.trim() } : {}),
           city: city.trim(),
           state: state.trim(),
           postalCode: postalCode.trim(),
@@ -170,7 +164,10 @@ export function CartScreen({
       setLastPaymentId(null);
       setOrderSuccess(result);
     } catch (err: unknown) {
-      const msg = (err as Error)?.message || 'Checkout is not available yet. No order has been placed.';
+      console.error('COD Checkout Error:', err);
+      const msg = err instanceof Error
+        ? err.message
+        : 'Failed to place Cash on Delivery order.';
       setCheckoutError(msg);
     } finally {
       setIsSubmitting(false);
@@ -181,11 +178,6 @@ export function CartScreen({
     setCheckoutError(null);
     if (!validateAddress()) return;
 
-    if (!IS_BACKEND_DEPLOYED) {
-      setCheckoutError('Checkout is not available yet. No order has been placed.');
-      return;
-    }
-
     setIsSubmitting(true);
     try {
       const rzpOrder = await createRazorpayOrderBackend({
@@ -195,7 +187,7 @@ export function CartScreen({
         })),
         shippingAddress: {
           street: street.trim(),
-          landmark: landmark.trim() || undefined,
+          ...(landmark.trim() ? { landmark: landmark.trim() } : {}),
           city: city.trim(),
           state: state.trim(),
           postalCode: postalCode.trim(),
@@ -211,7 +203,10 @@ export function CartScreen({
       setRazorpayOrderData(rzpOrder);
       setShowRazorpayModal(true);
     } catch (err: unknown) {
-      const msg = (err as Error)?.message || 'Failed to initialize Razorpay test checkout.';
+      console.error('Razorpay Order Creation Error:', err);
+      const msg = err instanceof Error
+        ? err.message
+        : 'Failed to initialize Razorpay test checkout.';
       setCheckoutError(msg);
     } finally {
       setIsSubmitting(false);
@@ -364,27 +359,12 @@ export function CartScreen({
         </View>
 
         {/* Security & Backend Availability Notice */}
-        {!IS_BACKEND_DEPLOYED ? (
-          <View style={styles.sparkPlanBanner}>
-            <View style={styles.sparkPlanHeader}>
-              <MaterialCommunityIcons name="cloud-alert" size={18} color="#fbbf24" />
-              <Text style={styles.sparkPlanTitle}>Checkout Status</Text>
-            </View>
-            <Text style={styles.sparkPlanMessage}>
-              Checkout is not available yet. No order has been placed.
-            </Text>
-            <Text style={styles.sparkPlanDesc}>
-              The project is running on the Firebase Spark free plan. Direct client order placement is disabled to maintain price and stock integrity until a trusted backend is connected.
-            </Text>
-          </View>
-        ) : (
-          <View style={styles.securityNoteCard}>
-            <MaterialCommunityIcons name="shield-lock-outline" size={18} color="#06b6d4" />
-            <Text style={styles.securityNoteText}>
-              Prices & stock reservations are verified authoritatively by Califnco Cloud Functions.
-            </Text>
-          </View>
-        )}
+        <View style={styles.securityNoteCard}>
+          <MaterialCommunityIcons name="shield-lock-outline" size={18} color="#06b6d4" />
+          <Text style={styles.securityNoteText}>
+            Connected to Califnco Backend. Prices, inventory reservations & payments are verified authoritatively.
+          </Text>
+        </View>
 
         {/* Price Breakdown */}
         <View style={styles.summaryCard}>
@@ -453,21 +433,6 @@ export function CartScreen({
           </View>
 
           <ScrollView contentContainerStyle={styles.modalScroll}>
-            {/* Notice when backend is not deployed */}
-            {!IS_BACKEND_DEPLOYED && (
-              <View style={styles.modalNoticeBox}>
-                <Feather name="info" size={18} color="#fbbf24" />
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.modalNoticeTitle}>Checkout Status</Text>
-                  <Text style={styles.modalNoticeText}>
-                    Checkout is not available yet. No order has been placed.
-                  </Text>
-                  <Text style={styles.modalNoticeSubtext}>
-                    Awaiting backend deployment on a hosted server or Firebase Blaze plan.
-                  </Text>
-                </View>
-              </View>
-            )}
 
             {/* Error Banner */}
             {checkoutError && (
@@ -678,6 +643,10 @@ export function CartScreen({
         }}
         onPaymentSuccess={handleRazorpaySuccess}
         onPaymentFailure={handleRazorpayFailure}
+        onSwitchToCod={() => {
+          setPaymentMethod('cod');
+          setShowCheckoutModal(true);
+        }}
       />
 
       {/* Order Success Screen / Modal */}

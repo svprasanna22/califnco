@@ -3,6 +3,7 @@ import {
   calculateAuthoritativeTotals,
   validateOrderItems,
   validateShippingAddress,
+  sanitizeForFirestore,
 } from '../services/orderCalculation';
 import { verifyRazorpaySignature } from '../razorpay';
 import type { ProductCatalogRecord } from '../types';
@@ -144,6 +145,135 @@ async function runPaymentTests() {
   };
   assert(failureRecordedState.payment.status === 'failed', 'Payment failure must record status "failed"');
   assert(mockCatalog.get('ro-stellar-7')!.stock === initialStock, 'Failed payment must not deduct inventory');
+  testsPassed++;
+
+  // Test 10: Omission of landmark when not provided or undefined in shipping address
+  const addrWithoutLandmark = validateShippingAddress({
+    street: '123 Outer Ring Road',
+    city: 'Bengaluru',
+    state: 'Karnataka',
+    postalCode: '560103',
+    country: 'India',
+  });
+  assert(!('landmark' in addrWithoutLandmark), 'Landmark key must not exist when omitted from input');
+  assert(addrWithoutLandmark.street === '123 Outer Ring Road', 'Street must be preserved');
+  assert(addrWithoutLandmark.city === 'Bengaluru', 'City must be preserved');
+  assert(addrWithoutLandmark.state === 'Karnataka', 'State must be preserved');
+  assert(addrWithoutLandmark.postalCode === '560103', 'Postal code must be preserved');
+  assert(addrWithoutLandmark.country === 'India', 'Country must be preserved');
+
+  const addrWithUndefinedLandmark = validateShippingAddress({
+    street: '123 Outer Ring Road',
+    landmark: undefined,
+    city: 'Bengaluru',
+    state: 'Karnataka',
+    postalCode: '560103',
+  });
+  assert(!('landmark' in addrWithUndefinedLandmark), 'Landmark key must not exist when provided as undefined');
+
+  const addrWithEmptyLandmark = validateShippingAddress({
+    street: '123 Outer Ring Road',
+    landmark: '   ',
+    city: 'Bengaluru',
+    state: 'Karnataka',
+    postalCode: '560103',
+  });
+  assert(!('landmark' in addrWithEmptyLandmark), 'Landmark key must not exist when provided as whitespace string');
+  testsPassed++;
+
+  // Test 11: Valid landmark preservation
+  const addrWithLandmark = validateShippingAddress({
+    street: '123 Outer Ring Road',
+    landmark: 'Near HDFC Bank',
+    city: 'Bengaluru',
+    state: 'Karnataka',
+    postalCode: '560103',
+  });
+  assert('landmark' in addrWithLandmark, 'Landmark key must exist when valid');
+  assert(addrWithLandmark.landmark === 'Near HDFC Bank', 'Landmark value must match');
+  testsPassed++;
+
+  // Test 12: sanitizeForFirestore purges undefined values across nested structures while preserving null
+  const dirtyData = {
+    orderNumber: 'ORD-TEST-1234',
+    dealer: undefined,
+    shippingAddress: {
+      street: '456 Main Road',
+      landmark: undefined,
+      city: 'Mumbai',
+    },
+    payment: {
+      transactionId: null, // null should be preserved in Firestore
+      token: undefined,
+    },
+    items: [
+      { productId: 'p1', imageUrl: undefined, quantity: 1 },
+      { productId: 'p2', imageUrl: 'https://example.com/p2.png', quantity: 2 },
+    ],
+  };
+
+  const sanitized = sanitizeForFirestore(dirtyData);
+  assert(!('dealer' in sanitized), 'Undefined top-level dealer field must be removed');
+  assert(!('landmark' in (sanitized as any).shippingAddress), 'Undefined nested landmark field must be removed');
+  assert(!('token' in (sanitized as any).payment), 'Undefined nested payment token must be removed');
+  assert((sanitized as any).payment.transactionId === null, 'null primitive value must be preserved');
+  assert(!('imageUrl' in (sanitized as any).items[0]), 'Undefined item property must be removed');
+  assert((sanitized as any).items[1].imageUrl === 'https://example.com/p2.png', 'Valid item property must be preserved');
+  testsPassed++;
+
+  // Test 13: Order document payload verification for Firestore
+  const sampleOrderPayload = {
+    orderNumber: 'ORD-SAMPLE-9999',
+    isTestOrder: true,
+    orderType: 'customer',
+    customer: {
+      uid: 'user_123',
+      email: 'customer@example.com',
+      name: 'Test Customer',
+      phone: '+91 9876543210',
+    },
+    shippingAddress: {
+      street: addrWithoutLandmark.street,
+      ...(addrWithoutLandmark.landmark?.trim() ? { landmark: addrWithoutLandmark.landmark.trim() } : {}),
+      city: addrWithoutLandmark.city,
+      state: addrWithoutLandmark.state,
+      postalCode: addrWithoutLandmark.postalCode,
+      country: addrWithoutLandmark.country || 'India',
+    },
+    items: calculation.lineItems,
+    pricing: calculation.pricing,
+    payment: {
+      method: 'cash_on_delivery',
+      status: 'cash_on_delivery',
+      transactionId: null,
+      isTestMode: true,
+      notes: 'Cash on delivery test order',
+    },
+    fulfillment: {
+      status: 'pending',
+      notes: 'Pending white-glove installation',
+    },
+  };
+
+  const finalPayload = sanitizeForFirestore(sampleOrderPayload);
+  assert(
+    !Object.prototype.hasOwnProperty.call(finalPayload.shippingAddress, 'landmark'),
+    'shippingAddress.landmark must be completely omitted from final Firestore payload'
+  );
+
+  function assertNoUndefined(obj: any, path: string = 'root') {
+    if (obj === null || obj === undefined) {
+      assert(obj !== undefined, `Found undefined at path: ${path}`);
+      return;
+    }
+    if (typeof obj === 'object') {
+      for (const [key, value] of Object.entries(obj)) {
+        assert(value !== undefined, `Found undefined at path: ${path}.${key}`);
+        assertNoUndefined(value, `${path}.${key}`);
+      }
+    }
+  }
+  assertNoUndefined(finalPayload);
   testsPassed++;
 
   console.log(`\nAll ${testsPassed} backend payment unit tests passed successfully!`);
