@@ -177,16 +177,16 @@ export function sanitizeForFirestore<T>(data: T): T {
 
   if (typeof data === 'object') {
     // Preserve FieldValue (e.g. serverTimestamp) or Date instances
+    const obj = data as Record<string, any>;
     if (
-      data.constructor &&
-      data.constructor.name !== 'Object' &&
-      typeof (data as any).isEqual !== 'function'
+      (obj.constructor && obj.constructor.name !== 'Object') ||
+      typeof obj.isEqual === 'function'
     ) {
       return data;
     }
 
     const cleanedObj: Record<string, any> = {};
-    for (const [key, value] of Object.entries(data)) {
+    for (const [key, value] of Object.entries(obj)) {
       if (value !== undefined) {
         cleanedObj[key] = sanitizeForFirestore(value);
       }

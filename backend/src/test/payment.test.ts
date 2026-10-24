@@ -6,6 +6,7 @@ import {
   sanitizeForFirestore,
 } from '../services/orderCalculation';
 import { verifyRazorpaySignature } from '../razorpay';
+import { FieldValue } from 'firebase-admin/firestore';
 import type { ProductCatalogRecord } from '../types';
 
 function assert(condition: boolean, message: string) {
@@ -253,12 +254,22 @@ async function runPaymentTests() {
       status: 'pending',
       notes: 'Pending white-glove installation',
     },
+    createdAt: FieldValue.serverTimestamp(),
+    updatedAt: new Date('2026-10-24T12:00:00Z'),
   };
 
   const finalPayload = sanitizeForFirestore(sampleOrderPayload);
   assert(
     !Object.prototype.hasOwnProperty.call(finalPayload.shippingAddress, 'landmark'),
     'shippingAddress.landmark must be completely omitted from final Firestore payload'
+  );
+  assert(
+    finalPayload.createdAt === sampleOrderPayload.createdAt,
+    'FieldValue.serverTimestamp() must be preserved by sanitizeForFirestore'
+  );
+  assert(
+    finalPayload.updatedAt === sampleOrderPayload.updatedAt,
+    'Date instances must be preserved by sanitizeForFirestore'
   );
 
   function assertNoUndefined(obj: any, path: string = 'root') {

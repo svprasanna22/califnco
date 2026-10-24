@@ -9,8 +9,8 @@ import {
   generateOrderNumber,
   sanitizeForFirestore,
 } from '../services/orderCalculation';
-import { getAuthoritativeCatalogRecords } from '../services/catalogService';
 import type {
+  ProductCatalogRecord,
   OrderDocument,
   OrderDealerInfo,
 } from '../types';
@@ -90,6 +90,39 @@ async function getVerifiedDealerInfo(
     businessName: String(dData.businessName || 'Authorized Dealership'),
     tier: String(dData.tier || 'silver'),
   };
+}
+
+/**
+ * Fetches authoritative product records from Firestore products collection.
+ * Security & Accuracy Guarantee:
+ * Re-reads current price and stock from Firestore to prevent client-side price tampering.
+ */
+async function getAuthoritativeCatalogRecords(
+  productIds: string[]
+): Promise<Map<string, ProductCatalogRecord>> {
+  const catalogMap = new Map<string, ProductCatalogRecord>();
+  const snapshots = await Promise.all(
+    productIds.map((id) => db.collection('products').doc(id).get())
+  );
+
+  for (let idx = 0; idx < productIds.length; idx++) {
+    const id = productIds[idx];
+    const snap = snapshots[idx];
+    if (!snap.exists) {
+      throw new Error(`Product with ID "${id}" was not found in the catalog.`);
+    }
+    const data = snap.data() || {};
+    catalogMap.set(id, {
+      id: snap.id,
+      name: String(data.name || 'Califnco Purifier'),
+      category: String(data.category || 'ro-purifiers'),
+      price: Number(data.price || 0),
+      stock: Number(data.stock ?? 0),
+      imageUrl: typeof data.imageUrl === 'string' && data.imageUrl.trim() ? data.imageUrl.trim() : undefined,
+    });
+  }
+
+  return catalogMap;
 }
 
 /**
