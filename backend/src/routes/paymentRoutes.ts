@@ -314,8 +314,14 @@ paymentRouter.post(
         });
       }
 
+      if (rzpPayment.order_id !== razorpayOrderId) {
+        return res.status(400).json({
+          error: 'Payment belongs to a different Razorpay order.',
+        });
+      }
+
       // Check payment status with gateway
-      if (rzpPayment.status !== 'captured' && rzpPayment.status !== 'authorized') {
+      if (rzpPayment.status !== 'captured') {
         await orderRef.update({
           'payment.status': 'failed',
           'payment.notes': `Gateway reported payment status as "${rzpPayment.status}".`,
