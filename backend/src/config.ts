@@ -17,7 +17,7 @@ const razorpayKeyId = process.env.RAZORPAY_KEY_ID || '';
 const razorpayKeySecret = process.env.RAZORPAY_KEY_SECRET || '';
 
 // If key ID starts with rzp_test_, it's test mode
-const isTestMode = razorpayKeyId.startsWith('rzp_test_') || process.env.NODE_ENV !== 'production';
+const isTestMode = !razorpayKeyId.startsWith('rzp_live_');
 
 export const config: BackendConfig = {
   port: parseInt(process.env.PORT || '8080', 10),
