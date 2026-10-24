@@ -5,7 +5,9 @@ import { AccessDenied } from './components/auth/AccessDenied';
 import { DashboardLayout, type NavViewKey } from './components/layout/DashboardLayout';
 import { DashboardView } from './components/views/DashboardView';
 import { ProductsView } from './components/views/ProductsView';
+import { InventoryView } from './components/views/InventoryView';
 import { OrdersView } from './components/views/OrdersView';
+import { CustomersView } from './components/views/CustomersView';
 import { DealersView } from './components/views/DealersView';
 import { ServiceRequestsView } from './components/views/ServiceRequestsView';
 import { SettingsView } from './components/views/SettingsView';
@@ -43,9 +45,11 @@ function AppContent() {
   // Authorized Administrator: Show Protected Dashboard Shell
   return (
     <DashboardLayout currentView={currentView} onNavigate={setCurrentView}>
-      {currentView === 'dashboard' && <DashboardView />}
+      {currentView === 'dashboard' && <DashboardView onNavigate={setCurrentView} />}
       {currentView === 'products' && <ProductsView />}
+      {currentView === 'inventory' && <InventoryView />}
       {currentView === 'orders' && <OrdersView />}
+      {currentView === 'customers' && <CustomersView />}
       {currentView === 'dealers' && <DealersView />}
       {currentView === 'service' && <ServiceRequestsView />}
       {currentView === 'settings' && <SettingsView />}

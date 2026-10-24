@@ -243,3 +243,44 @@ export function TrashIcon({ className = '', ...props }: IconProps) {
   );
 }
 
+export function UsersIcon({ className = '', ...props }: IconProps) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} {...props}>
+      <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+      <circle cx="9" cy="7" r="4" />
+      <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+      <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+    </svg>
+  );
+}
+
+export function RupeeIcon({ className = '', ...props }: IconProps) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} {...props}>
+      <path d="M6 3h12M6 8h12M6 13l8.5 8M6 13h3a4 4 0 0 0 0-8" />
+    </svg>
+  );
+}
+
+export function TrendingUpIcon({ className = '', ...props }: IconProps) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} {...props}>
+      <polyline points="23 6 13.5 15.5 8.5 10.5 1 18" />
+      <polyline points="17 6 23 6 23 12" />
+    </svg>
+  );
+}
+
+export function InventoryIcon({ className = '', ...props }: IconProps) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} {...props}>
+      <polyline points="22 12 16 12 14 15 10 15 8 12 2 12" />
+      <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
+      <line x1="6" y1="16" x2="6.01" y2="16" />
+      <line x1="10" y1="16" x2="10.01" y2="16" />
+    </svg>
+  );
+}
+
+
+

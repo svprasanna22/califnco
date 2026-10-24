@@ -5,8 +5,7 @@ import {
   where,
   orderBy,
 } from 'firebase/firestore';
-import { httpsCallable } from 'firebase/functions';
-import { db, functions, auth } from './firebase';
+import { db, auth } from './firebase';
 import type { Order } from '../types/order';
 
 const ORDERS_COLLECTION = 'orders';
@@ -71,18 +70,38 @@ export interface VerifyPaymentResult {
 }
 
 /**
- * Trusted Backend Availability Configuration:
- *
- * Current Firebase Plan: Spark (Free tier).
- * Cloud Functions deployment is disabled because Cloud Functions v2 requires the Blaze plan.
- *
- * To avoid unauthorized client writes or unverified orders, direct client-side
- * Firestore order creation is strictly disallowed.
- *
- * Once a trusted backend (Render Node.js backend or Firebase Cloud Functions on Blaze)
- * is deployed, toggle `IS_BACKEND_DEPLOYED` to `true`.
+ * Backend availability flag. Active with Render Node.js backend.
  */
-export const IS_BACKEND_DEPLOYED = false;
+export const IS_BACKEND_DEPLOYED = true;
+
+/**
+ * Robust network fetch helper with diagnostic errors
+ */
+async function safeBackendFetch(url: string, options: RequestInit): Promise<any> {
+  let response: Response;
+  try {
+    response = await fetch(url, options);
+  } catch (netErr: any) {
+    console.error(`Network fetch failed for ${url}:`, netErr);
+    throw new Error(
+      `Unable to reach Califnco backend server (${BACKEND_API_BASE_URL}). If using Render free tier, the server may be waking from sleep (please retry in 30 seconds).`
+    );
+  }
+
+  const text = await response.text();
+  let data: any = {};
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Server returned HTTP ${response.status}: ${text.slice(0, 150)}`);
+  }
+
+  if (!response.ok) {
+    throw new Error(data?.error || `Request failed with status ${response.status}`);
+  }
+
+  return data;
+}
 
 /**
  * Creates a Razorpay Test Order via the secure Render backend.
@@ -91,18 +110,14 @@ export const IS_BACKEND_DEPLOYED = false;
 export async function createRazorpayOrderBackend(
   input: PlaceOrderInput
 ): Promise<CreateRazorpayOrderResult> {
-  if (!IS_BACKEND_DEPLOYED) {
-    throw new Error('Checkout is not available yet. No order has been placed.');
-  }
-
   const currentUser = auth.currentUser;
   if (!currentUser) {
-    throw new Error('Please sign in to place an order.');
+    throw new Error('Please sign in to your Califnco account to place an order.');
   }
 
   const idToken = await currentUser.getIdToken();
 
-  const response = await fetch(`${BACKEND_API_BASE_URL}/api/payments/create-razorpay-order`, {
+  return await safeBackendFetch(`${BACKEND_API_BASE_URL}/api/payments/create-razorpay-order`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -115,13 +130,6 @@ export async function createRazorpayOrderBackend(
       orderType: input.orderType || 'customer',
     }),
   });
-
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data?.error || 'Failed to initialize Razorpay test payment.');
-  }
-
-  return data;
 }
 
 /**
@@ -131,10 +139,6 @@ export async function createRazorpayOrderBackend(
 export async function verifyRazorpayPaymentBackend(
   data: VerifyPaymentInput
 ): Promise<VerifyPaymentResult> {
-  if (!IS_BACKEND_DEPLOYED) {
-    throw new Error('Checkout is not available yet. No order has been placed.');
-  }
-
   const currentUser = auth.currentUser;
   if (!currentUser) {
     throw new Error('Please sign in to verify your payment.');
@@ -142,7 +146,7 @@ export async function verifyRazorpayPaymentBackend(
 
   const idToken = await currentUser.getIdToken();
 
-  const response = await fetch(`${BACKEND_API_BASE_URL}/api/payments/verify-payment`, {
+  return await safeBackendFetch(`${BACKEND_API_BASE_URL}/api/payments/verify-payment`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -150,13 +154,6 @@ export async function verifyRazorpayPaymentBackend(
     },
     body: JSON.stringify(data),
   });
-
-  const resData = await response.json();
-  if (!response.ok) {
-    throw new Error(resData?.error || 'Payment signature verification failed.');
-  }
-
-  return resData;
 }
 
 /**
@@ -167,8 +164,6 @@ export async function reportPaymentFailureBackend(
   razorpayOrderId?: string,
   errorDescription?: string
 ): Promise<void> {
-  if (!IS_BACKEND_DEPLOYED) return;
-
   const currentUser = auth.currentUser;
   if (!currentUser) return;
 
@@ -192,65 +187,36 @@ export async function reportPaymentFailureBackend(
 }
 
 /**
- * Places an order via the trusted Firebase Cloud Functions backend ('createOrder').
+ * Places a Cash on Delivery order via the secure Render backend.
  *
- * Security & Integrity Guarantees:
+ * Security & Accuracy Guarantees:
  * - Does NOT perform direct Firestore order writes from the client.
  * - Server validates stock atomically in a transaction and calculates authoritative pricing.
- * - Enforces Cash on Delivery with pending status.
- * - If backend is not deployed or unreachable, fails gracefully with:
- *   "Checkout is not available yet. No order has been placed."
+ * - Enforces Cash on Delivery with pending status and reserves inventory.
  */
 export async function submitOrderToBackend(
   input: PlaceOrderInput
 ): Promise<PlaceOrderResult> {
-  // Graceful guard when operating on the Firebase Spark free plan
-  if (!IS_BACKEND_DEPLOYED) {
-    throw new Error('Checkout is not available yet. No order has been placed.');
+  const currentUser = auth.currentUser;
+  if (!currentUser) {
+    throw new Error('Please sign in to your Califnco account to place an order.');
   }
 
-  const createOrderCallable = httpsCallable<any, PlaceOrderResult>(functions, 'createOrder');
+  const idToken = await currentUser.getIdToken();
 
-  try {
-    const response = await createOrderCallable({
+  return await safeBackendFetch(`${BACKEND_API_BASE_URL}/api/payments/create-cod-order`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${idToken}`,
+    },
+    body: JSON.stringify({
       items: input.items,
       shippingAddress: input.shippingAddress,
       customerInfo: input.customerInfo,
-      paymentMethod: 'cash_on_delivery',
       orderType: input.orderType || 'customer',
-    });
-    return response.data;
-  } catch (error: any) {
-    console.error('Error invoking createOrder Cloud Function:', error);
-    const code = error?.code;
-    const rawMessage = error?.message || '';
-
-    if (code === 'functions/unauthenticated' || code === 'unauthenticated') {
-      throw new Error('Please sign in to your Califnco account to place an order.');
-    }
-    if (code === 'functions/failed-precondition' || code === 'failed-precondition') {
-      throw new Error(`Inventory check failed: ${rawMessage}`);
-    }
-    if (code === 'functions/invalid-argument' || code === 'invalid-argument') {
-      throw new Error(`Order details error: ${rawMessage}`);
-    }
-
-    // If Cloud Functions are not deployed (HTTP 404), unavailable, internal error, or network failure:
-    if (
-      code === 'functions/not-found' ||
-      code === 'not-found' ||
-      code === 'functions/unavailable' ||
-      code === 'unavailable' ||
-      code === 'functions/internal' ||
-      code === 'internal' ||
-      rawMessage.includes('NOT_FOUND') ||
-      rawMessage.includes('network')
-    ) {
-      throw new Error('Checkout is not available yet. No order has been placed.');
-    }
-
-    throw new Error(rawMessage || 'Checkout is not available yet. No order has been placed.');
-  }
+    }),
+  });
 }
 
 /**

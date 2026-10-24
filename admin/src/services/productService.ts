@@ -138,6 +138,63 @@ export async function updateProduct(
   }
 }
 
+export type StockStatus = 'in_stock' | 'low_stock' | 'out_of_stock' | 'invalid';
+
+/**
+ * Evaluates stock quantity against authoritative business thresholds:
+ * - in_stock: stock > 5
+ * - low_stock: 1 <= stock <= 5
+ * - out_of_stock: stock === 0
+ * - invalid: missing, null, undefined, negative, or NaN
+ */
+export function getStockStatus(stock: any): StockStatus {
+  if (
+    stock === null ||
+    stock === undefined ||
+    typeof stock !== 'number' ||
+    isNaN(stock) ||
+    !Number.isFinite(stock) ||
+    stock < 0 ||
+    !Number.isInteger(stock)
+  ) {
+    return 'invalid';
+  }
+  if (stock === 0) {
+    return 'out_of_stock';
+  }
+  if (stock <= 5) {
+    return 'low_stock';
+  }
+  return 'in_stock';
+}
+
+/**
+ * Safely updates only the stock quantity of a product in Cloud Firestore.
+ * Preserves all other product fields (name, price, imageUrl, description, etc.).
+ * Strictly validates that newStock is a finite, non-negative integer.
+ */
+export async function updateProductStock(
+  productId: string,
+  newStock: number,
+  adminUid: string
+): Promise<void> {
+  if (!Number.isInteger(newStock) || newStock < 0 || !Number.isFinite(newStock)) {
+    throw new Error('Stock quantity must be a finite, non-negative integer (0 or greater).');
+  }
+
+  try {
+    const productDocRef = doc(db, PRODUCTS_COLLECTION, productId);
+    await updateDoc(productDocRef, {
+      stock: newStock,
+      updatedAt: serverTimestamp(),
+      updatedBy: adminUid,
+    });
+  } catch (error: unknown) {
+    console.error(`Error updating stock for product ${productId}:`, error);
+    throw new Error(getFriendlyFirestoreErrorMessage(error));
+  }
+}
+
 /**
  * Deletes a product from Firestore
  */
