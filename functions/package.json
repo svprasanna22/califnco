@@ -1,0 +1,24 @@
+{
+  "name": "califnco-functions",
+  "description": "Califnco Trusted Backend Cloud Functions for Order Processing",
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "serve": "npm run build && npx firebase-tools emulators:start --only functions",
+    "deploy": "npx firebase-tools deploy --only functions",
+    "test": "npm run build && node dist/test/orderValidation.test.js"
+  },
+  "engines": {
+    "node": "20"
+  },
+  "main": "dist/index.js",
+  "dependencies": {
+    "firebase-admin": "^13.1.0",
+    "firebase-functions": "^6.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "typescript": "^5.7.3"
+  },
+  "private": true
+}
