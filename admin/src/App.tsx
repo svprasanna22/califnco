@@ -8,6 +8,7 @@ import { ProductsView } from './components/views/ProductsView';
 import { InventoryView } from './components/views/InventoryView';
 import { OrdersView } from './components/views/OrdersView';
 import { CustomersView } from './components/views/CustomersView';
+import { AutomationView } from './components/views/AutomationView';
 import { DealersView } from './components/views/DealersView';
 import { ServiceRequestsView } from './components/views/ServiceRequestsView';
 import { SettingsView } from './components/views/SettingsView';
@@ -50,6 +51,7 @@ function AppContent() {
       {currentView === 'inventory' && <InventoryView />}
       {currentView === 'orders' && <OrdersView />}
       {currentView === 'customers' && <CustomersView />}
+      {currentView === 'automation' && <AutomationView />}
       {currentView === 'dealers' && <DealersView />}
       {currentView === 'service' && <ServiceRequestsView />}
       {currentView === 'settings' && <SettingsView />}

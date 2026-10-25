@@ -16,9 +16,10 @@ import {
   SearchIcon,
   UsersIcon,
   InventoryIcon,
+  SparklesIcon,
 } from '../common/Icons';
 
-export type NavViewKey = 'dashboard' | 'products' | 'inventory' | 'orders' | 'customers' | 'dealers' | 'service' | 'settings';
+export type NavViewKey = 'dashboard' | 'products' | 'inventory' | 'orders' | 'customers' | 'automation' | 'dealers' | 'service' | 'settings';
 
 interface DashboardLayoutProps {
   currentView: NavViewKey;
@@ -36,6 +37,7 @@ export function DashboardLayout({ currentView, onNavigate, children }: Dashboard
     { key: 'inventory' as NavViewKey, label: 'Inventory', icon: <InventoryIcon style={{ width: 18, height: 18 }} /> },
     { key: 'orders' as NavViewKey, label: 'Orders', icon: <OrdersIcon style={{ width: 18, height: 18 }} /> },
     { key: 'customers' as NavViewKey, label: 'Customers', icon: <UsersIcon style={{ width: 18, height: 18 }} /> },
+    { key: 'automation' as NavViewKey, label: 'AI Automation', icon: <SparklesIcon style={{ width: 18, height: 18 }} /> },
     { key: 'dealers' as NavViewKey, label: 'Dealers', icon: <DealersIcon style={{ width: 18, height: 18 }} /> },
     { key: 'service' as NavViewKey, label: 'Service Requests', icon: <ServiceIcon style={{ width: 18, height: 18 }} /> },
     { key: 'settings' as NavViewKey, label: 'Settings', icon: <SettingsIcon style={{ width: 18, height: 18 }} /> },
