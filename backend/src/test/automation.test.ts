@@ -11,8 +11,17 @@ import {
   generateWithPollinations,
   generateWithHuggingFace,
   generatePromotionalImage,
+  resolveFallbackImageBuffer,
+  VERIFIED_BRAND_ASSET_URLS,
 } from '../services/aiImageService';
-import { verifyPublicImageUrl, isPublicHttpsUrl, isHostnamePublic, isPrivateHost } from '../services/imageHostingService';
+import {
+  verifyPublicImageUrl,
+  isPublicHttpsUrl,
+  isHostnamePublic,
+  isPrivateHost,
+  hostPromotionalImage,
+  uploadToCloudinary,
+} from '../services/imageHostingService';
 import {
   publishToInstagramGraphApi,
   getInstagramApiBaseUrl,
@@ -381,22 +390,22 @@ async function runAutomationTests() {
 
   const retryResult = await generateWithPollinations('test water purifier prompt', mockRetryFetcher as any);
   assert(retryResult !== null, 'Pollinations must recover after transient 503 retry');
-  assert(retryResult?.model === 'flux', 'Recovered attempt must succeed with primary FLUX model');
+  assert(retryResult?.model === 'turbo', 'Recovered attempt must succeed with primary Turbo model');
   assert(attemptCount === 2, 'Must have executed exactly 2 attempts');
   console.log('   [PASS] Pollinations successfully retried transient HTTP 503 and succeeded on second attempt');
 
-  // Test 19: Pollinations Model Fallback (FLUX -> Turbo)
-  console.log('\n19. Testing Pollinations model failover from FLUX to Turbo...');
-  let fluxAttemptCount = 0;
+  // Test 19: Pollinations Model Fallback (Turbo -> FLUX)
+  console.log('\n19. Testing Pollinations model failover from Turbo to FLUX...');
   let turboAttemptCount = 0;
+  let fluxAttemptCount = 0;
   const mockFallbackFetcher = async (input: string | URL | Request) => {
     const urlStr = String(input);
-    if (urlStr.includes('model=flux')) {
-      fluxAttemptCount++;
-      return new Response('FLUX capacity exhausted', { status: 503, headers: { 'Content-Type': 'text/plain' } });
-    }
     if (urlStr.includes('model=turbo')) {
       turboAttemptCount++;
+      return new Response('Turbo capacity exhausted', { status: 503, headers: { 'Content-Type': 'text/plain' } });
+    }
+    if (urlStr.includes('model=flux')) {
+      fluxAttemptCount++;
       return new Response(mockJpegBuffer, {
         status: 200,
         headers: { 'Content-Type': 'image/jpeg' },
@@ -407,14 +416,14 @@ async function runAutomationTests() {
 
   const fallbackResult = await generateWithPollinations('test prompt', mockFallbackFetcher as any);
   assert(fallbackResult !== null, 'Must succeed via fallback model');
-  assert(fallbackResult?.model === 'turbo', 'Must fall back to turbo model when FLUX fails');
-  assert(fluxAttemptCount === 2, 'Must exhaust FLUX retries before falling back');
-  assert(turboAttemptCount === 1, 'Turbo model must succeed');
+  assert(fallbackResult?.model === 'flux', 'Must fall back to flux model when Turbo fails');
+  assert(turboAttemptCount === 2, 'Must exhaust Turbo retries before falling back');
+  assert(fluxAttemptCount === 1, 'FLUX model must succeed');
 
   const facadeResult = await generatePromotionalImage(mockProduct, mockFallbackFetcher as any);
-  assert(facadeResult.provider === 'pollinations-turbo', 'Facade must report provider as pollinations-turbo');
+  assert(facadeResult.provider === 'pollinations-flux', 'Facade must report provider as pollinations-flux');
   assert(facadeResult.imageBuffer.length >= 1000, 'Image buffer must be valid');
-  console.log('   [PASS] Model failover successfully transitioned from overloaded FLUX to turbo fallback');
+  console.log('   [PASS] Model failover successfully transitioned from Turbo to FLUX fallback');
 
   // Test 20: Pollinations Timeout & Provider Exhaustion Error Handling
   console.log('\n20. Testing Pollinations timeout and exhausted provider failure...');
@@ -581,7 +590,246 @@ async function runAutomationTests() {
   assert(metaResult === 'NEW_CIPHERTEXT_IN_VAULT', 'Verified token remains active when only metadata update fails');
   console.log('   [PASS] Partial write failures explicitly track persisted state, fail closed, and isolate auxiliary metadata');
 
-  console.log('\n--- All 23 AI Instagram Automation Unit Tests Passed Successfully! ---');
+  // Test 24: Three-Tier Fallback Waterfall Order (AI Turbo -> FLUX -> Catalog Image -> Brand Asset Pool)
+  console.log('\n24. Testing three-tier image fallback waterfall order...');
+
+  // 24.1 Pollinations Turbo is tried first, then FLUX
+  const calledModels: string[] = [];
+  const validJpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.alloc(1024, 0xaa)]);
+
+  const mockPollinationsFetcher = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const urlStr = String(input);
+    const modelMatch = urlStr.match(/model=(\w+)/);
+    const model = modelMatch ? modelMatch[1] : '';
+    calledModels.push(model);
+
+    // Verify browser headers
+    const headers = init?.headers as Record<string, string>;
+    assert(headers?.['User-Agent']?.includes('Mozilla/5.0'), 'Must include browser-like User-Agent header');
+    assert(headers?.['Accept']?.includes('image/'), 'Must include image Accept header');
+
+    if (model === 'turbo') {
+      // Simulate Cloudflare HTML block for turbo
+      return {
+        ok: false,
+        status: 403,
+        headers: new Headers({ 'content-type': 'text/html' }),
+        text: async () => '<html>Cloudflare Turnstile Block</html>',
+      } as any;
+    }
+    if (model === 'flux') {
+      // Simulate FLUX succeeding
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ 'content-type': 'image/jpeg' }),
+        arrayBuffer: async () => validJpeg.buffer.slice(validJpeg.byteOffset, validJpeg.byteOffset + validJpeg.byteLength),
+      } as any;
+    }
+    return { ok: false, status: 500 } as any;
+  };
+
+  const polResult = await generateWithPollinations('luxury water purifier', mockPollinationsFetcher as any);
+  assert(polResult !== null, 'Pollinations must succeed via FLUX fallback');
+  assert(calledModels[0] === 'turbo', 'Pollinations must try turbo first');
+  assert(calledModels.includes('flux'), 'Pollinations must failover to flux');
+  assert(polResult?.model === 'flux', 'Returned model must be flux');
+  console.log('   [PASS] Pollinations tries Turbo first with browser headers, then falls over to FLUX');
+
+  // 24.2 Fallback to Catalog Image when AI fails and catalog URL is valid public HTTPS
+  const catalogPublicProduct: ProductForMarketing = {
+    ...mockProduct,
+    imageUrl: 'https://images.unsplash.com/photo-water-purifier-califnco.jpg',
+  };
+
+  const mockCatalogFetcher = async (input: RequestInfo | URL) => {
+    const urlStr = String(input);
+    if (urlStr === catalogPublicProduct.imageUrl) {
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ 'content-type': 'image/jpeg' }),
+        arrayBuffer: async () => validJpeg.buffer.slice(validJpeg.byteOffset, validJpeg.byteOffset + validJpeg.byteLength),
+      } as any;
+    }
+    return { ok: false, status: 404 } as any;
+  };
+
+  const catalogFallbackResult = await resolveFallbackImageBuffer(catalogPublicProduct, mockCatalogFetcher as any);
+  assert(catalogFallbackResult !== null, 'Catalog fallback must succeed when valid public HTTPS image is available');
+  assert(catalogFallbackResult?.source === 'catalog-image', 'Source must be catalog-image');
+  assert(catalogFallbackResult?.sourceUrl === catalogPublicProduct.imageUrl, 'Source URL must match catalog image');
+  assert(isValidImageBuffer(catalogFallbackResult!.imageBuffer), 'Buffer must be valid image');
+  console.log('   [PASS] Fallback successfully resolves valid public HTTPS catalog image');
+
+  // 24.3 Fallback to Brand Asset Pool when catalog image is relative or unavailable
+  const relativeProduct: ProductForMarketing = {
+    ...mockProduct,
+    imageUrl: '/products/product-04.png', // Relative path must be rejected
+  };
+
+  const mockBrandPoolFetcher = async (input: RequestInfo | URL) => {
+    const urlStr = String(input);
+    // Relative catalog URL must NEVER be fetched
+    assert(!urlStr.startsWith('/products'), 'Relative paths must never be fetched');
+    if (VERIFIED_BRAND_ASSET_URLS.includes(urlStr)) {
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ 'content-type': 'image/jpeg' }),
+        arrayBuffer: async () => validJpeg.buffer.slice(validJpeg.byteOffset, validJpeg.byteOffset + validJpeg.byteLength),
+      } as any;
+    }
+    return { ok: false, status: 404 } as any;
+  };
+
+  const brandPoolResult = await resolveFallbackImageBuffer(relativeProduct, mockBrandPoolFetcher as any);
+  assert(brandPoolResult !== null, 'Brand pool fallback must succeed for product with relative image');
+  assert(brandPoolResult?.source === 'brand-pool', 'Source must be brand-pool');
+  assert(VERIFIED_BRAND_ASSET_URLS.includes(brandPoolResult!.sourceUrl), 'Source URL must be from verified brand asset pool');
+  assert(isValidImageBuffer(brandPoolResult!.imageBuffer), 'Brand asset buffer must be valid');
+  console.log('   [PASS] Fallback resolves to verified Califnco brand asset pool when catalog path is relative');
+
+  // 24.4 Cloudinary buffer upload from fallback image
+  const prevCloudinaryPreset = config.cloudinaryUploadPreset;
+  config.cloudinaryUploadPreset = 'califnco_test_preset';
+  let uploadedBufferReceived: Buffer | null = null;
+  const mockCloudinaryFetcher = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const urlStr = String(input);
+    if (urlStr.includes('api.cloudinary.com')) {
+      const body = init?.body as FormData;
+      const fileData = body?.get('file') as string;
+      if (fileData?.startsWith('data:image/jpeg;base64,')) {
+        uploadedBufferReceived = Buffer.from(fileData.replace('data:image/jpeg;base64,', ''), 'base64');
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          secure_url: 'https://res.cloudinary.com/oxeow2gv/image/upload/v12345/califnco/instagram/fallback_test.jpg',
+        }),
+      } as any;
+    }
+    // For verifyPublicImageUrl HEAD request
+    if (urlStr.includes('fallback_test.jpg')) {
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ 'content-type': 'image/jpeg' }),
+      } as any;
+    }
+    return { ok: false, status: 404 } as any;
+  };
+
+  let hostedFallback: any;
+  try {
+    hostedFallback = await hostPromotionalImage(brandPoolResult!.imageBuffer, undefined, mockCloudinaryFetcher as any);
+  } finally {
+    config.cloudinaryUploadPreset = prevCloudinaryPreset;
+  }
+
+  assert(hostedFallback.provider === 'cloudinary', 'Hosted provider must be Cloudinary');
+  assert(hostedFallback.verified === true, 'Hosted image must be verified');
+  assert(isPublicHttpsUrl(hostedFallback.publicUrl), 'Hosted URL must be public HTTPS');
+  assert(uploadedBufferReceived !== null && (uploadedBufferReceived as Buffer).length > 0, 'Buffer must be successfully uploaded to Cloudinary');
+  console.log('   [PASS] Fallback image buffer uploaded to Cloudinary and verified before pipeline publishing');
+
+  // Test 25: Fallback Rejection, Download Failures, Upload Failures, and Fail-Closed Behavior
+  console.log('\n25. Testing fallback error handling, SSRF rejections, upload failure, and fail-closed behavior...');
+
+  // 25.1 SSRF / Private IP / Insecure catalog URLs rejected
+  const maliciousProduct1: ProductForMarketing = {
+    ...mockProduct,
+    imageUrl: 'https://169.254.169.254/computeMetadata/v1/image.jpg',
+  };
+  const maliciousProduct2: ProductForMarketing = {
+    ...mockProduct,
+    imageUrl: 'http://insecure-http.com/image.jpg',
+  };
+  const maliciousProduct3: ProductForMarketing = {
+    ...mockProduct,
+    imageUrl: 'https://localhost:8080/internal.jpg',
+  };
+
+  let attemptedFetches: string[] = [];
+  const trackingFetcher = async (input: RequestInfo | URL) => {
+    attemptedFetches.push(String(input));
+    return { ok: false, status: 404 } as any;
+  };
+
+  await resolveFallbackImageBuffer(maliciousProduct1, trackingFetcher as any);
+  await resolveFallbackImageBuffer(maliciousProduct2, trackingFetcher as any);
+  await resolveFallbackImageBuffer(maliciousProduct3, trackingFetcher as any);
+
+  assert(!attemptedFetches.includes(maliciousProduct1.imageUrl!), 'Cloud metadata URL must NEVER be fetched by fallback resolver');
+  assert(!attemptedFetches.includes(maliciousProduct2.imageUrl!), 'Insecure HTTP URL must NEVER be fetched by fallback resolver');
+  assert(!attemptedFetches.includes(maliciousProduct3.imageUrl!), 'Localhost URL must NEVER be fetched by fallback resolver');
+  console.log('   [PASS] Catalog image fallback strictly rejects metadata, HTTP, and internal hostnames');
+
+  // 25.2 Catalog image download failure (HTTP 500 / corrupt buffer) falls through cleanly to brand pool
+  const failingCatalogProduct: ProductForMarketing = {
+    ...mockProduct,
+    imageUrl: 'https://cdn.example.com/products/ro-broken.jpg',
+  };
+
+  const corruptImageFetcher = async (input: RequestInfo | URL) => {
+    const urlStr = String(input);
+    if (urlStr === failingCatalogProduct.imageUrl) {
+      return {
+        ok: false,
+        status: 500,
+        headers: new Headers({ 'content-type': 'text/html' }),
+      } as any;
+    }
+    if (VERIFIED_BRAND_ASSET_URLS.includes(urlStr)) {
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ 'content-type': 'image/jpeg' }),
+        arrayBuffer: async () => validJpeg.buffer.slice(validJpeg.byteOffset, validJpeg.byteOffset + validJpeg.byteLength),
+      } as any;
+    }
+    return { ok: false, status: 404 } as any;
+  };
+
+  const recoveredFromCorrupt = await resolveFallbackImageBuffer(failingCatalogProduct, corruptImageFetcher as any);
+  assert(recoveredFromCorrupt !== null, 'Must fall through to brand pool on catalog download failure');
+  assert(recoveredFromCorrupt?.source === 'brand-pool', 'Must fall through to brand-pool');
+  console.log('   [PASS] Catalog image download failure seamlessly falls through to brand asset pool');
+
+  // 25.3 Cloudinary upload failure causes pipeline to fail closed
+  config.cloudinaryUploadPreset = 'califnco_test_preset';
+  const failingCloudinaryFetcher = async (input: RequestInfo | URL) => {
+    const urlStr = String(input);
+    if (urlStr.includes('api.cloudinary.com')) {
+      return {
+        ok: false,
+        status: 500,
+        text: async () => 'Internal Cloudinary Error',
+      } as any;
+    }
+    return { ok: false, status: 500 } as any;
+  };
+
+  let hostingFailedClosed = false;
+  try {
+    await hostPromotionalImage(validJpeg, undefined, failingCloudinaryFetcher as any);
+  } catch (err: any) {
+    hostingFailedClosed = true;
+    assert(err.message.includes('Failed to obtain a verified, publicly accessible HTTPS image URL'), 'Must throw descriptive error');
+  } finally {
+    config.cloudinaryUploadPreset = prevCloudinaryPreset;
+  }
+  assert(hostingFailedClosed === true, 'hostPromotionalImage must throw and fail closed when Cloudinary upload fails');
+  console.log('   [PASS] Cloudinary upload failure halts pipeline and fails closed');
+
+  // 25.4 Complete exhaustion (all tiers fail) returns null and fails closed cleanly
+  const allFailingFetcher = async () => ({ ok: false, status: 503 } as any);
+  const exhaustedFallback = await resolveFallbackImageBuffer(failingCatalogProduct, allFailingFetcher as any);
+  assert(exhaustedFallback === null, 'resolveFallbackImageBuffer must return null when all tiers fail');
+  console.log('   [PASS] Exhaustion of all fallback tiers returns null and allows pipeline to fail closed cleanly');
+
+  console.log('\n--- All 25 AI Instagram Automation Unit Tests Passed Successfully! ---');
 }
 
 runAutomationTests().catch((err) => {

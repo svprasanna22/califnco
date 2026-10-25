@@ -10,7 +10,10 @@ export interface HostedImageResult {
 /**
  * Uploads an image buffer to Cloudinary
  */
-async function uploadToCloudinary(imageBuffer: Buffer): Promise<string | null> {
+export async function uploadToCloudinary(
+  imageBuffer: Buffer,
+  fetcher: typeof fetch = fetch
+): Promise<string | null> {
   const cloudName = config.cloudinaryCloudName || 'oxeow2gv';
   if (!cloudName) return null;
 
@@ -38,7 +41,7 @@ async function uploadToCloudinary(imageBuffer: Buffer): Promise<string | null> {
   }
 
   try {
-    const response = await fetch(url, {
+    const response = await fetcher(url, {
       method: 'POST',
       body: formData,
     });
@@ -289,12 +292,13 @@ export async function verifyPublicImageUrl(
  */
 export async function hostPromotionalImage(
   imageBuffer: Buffer,
-  directPublicUrl?: string
+  directPublicUrl?: string,
+  fetcher: typeof fetch = fetch
 ): Promise<HostedImageResult> {
   // 1. Try Cloudinary
   try {
-    const cUrl = await uploadToCloudinary(imageBuffer);
-    if (cUrl && (await verifyPublicImageUrl(cUrl))) {
+    const cUrl = await uploadToCloudinary(imageBuffer, fetcher);
+    if (cUrl && (await verifyPublicImageUrl(cUrl, fetcher))) {
       return {
         publicUrl: cUrl,
         provider: 'cloudinary',
@@ -308,7 +312,7 @@ export async function hostPromotionalImage(
   // 2. Try ImgBB
   try {
     const iUrl = await uploadToImgBB(imageBuffer);
-    if (iUrl && (await verifyPublicImageUrl(iUrl))) {
+    if (iUrl && (await verifyPublicImageUrl(iUrl, fetcher))) {
       return {
         publicUrl: iUrl,
         provider: 'imgbb',
@@ -320,7 +324,7 @@ export async function hostPromotionalImage(
   }
 
   // 3. If direct public URL was provided (e.g. Pollinations public CDN), verify and return
-  if (directPublicUrl && isPublicHttpsUrl(directPublicUrl) && (await verifyPublicImageUrl(directPublicUrl))) {
+  if (directPublicUrl && isPublicHttpsUrl(directPublicUrl) && (await verifyPublicImageUrl(directPublicUrl, fetcher))) {
     return {
       publicUrl: directPublicUrl,
       provider: 'direct-public-url',

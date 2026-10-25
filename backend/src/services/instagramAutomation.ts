@@ -5,7 +5,12 @@ import {
   type ProductForMarketing,
   type GeneratedCaptionResult,
 } from './aiCaptionService';
-import { generatePromotionalImage, type GeneratedImageResult } from './aiImageService';
+import {
+  generatePromotionalImage,
+  resolveFallbackImageBuffer,
+  type GeneratedImageResult,
+  type FallbackImageResult,
+} from './aiImageService';
 import { hostPromotionalImage, isPublicHttpsUrl, type HostedImageResult } from './imageHostingService';
 import {
   publishToInstagramGraphApi,
@@ -351,6 +356,7 @@ export async function executeDailyInstagramPosting(
 
   let captionResult: GeneratedCaptionResult | undefined;
   let imageResult: GeneratedImageResult | undefined;
+  let imageProvider: string = 'none';
   let hostedResult: HostedImageResult | undefined;
   let publishResult: InstagramPublishResult | undefined;
   let runStatus: 'published' | 'awaiting_credentials' | 'failed' = 'failed';
@@ -373,15 +379,40 @@ export async function executeDailyInstagramPosting(
     console.log(`[Automation] Caption generated via provider: ${captionResult.provider}`);
 
     // ----------------------------------------------------
-    // STEP 5: Generate Promotional Product Image
+    // STEP 5: Generate Promotional Product Image (Tier 1: AI Generation)
     // ----------------------------------------------------
-    imageResult = await generatePromotionalImage(selectedProduct);
-    console.log(`[Automation] Promotional image generated via provider: ${imageResult.provider}`);
+    let imageBuffer: Buffer;
+    let directPublicUrl: string | undefined;
+
+    try {
+      imageResult = await generatePromotionalImage(selectedProduct);
+      imageBuffer = imageResult.imageBuffer;
+      imageProvider = imageResult.provider;
+      directPublicUrl = imageResult.directPublicUrl;
+      console.log(`[Automation] Promotional image generated via provider: ${imageResult.provider}`);
+    } catch (aiErr: unknown) {
+      console.warn(`[Automation] AI generation failed (${(aiErr as Error)?.message || aiErr}). Engaging fallback image resolver...`);
+
+      // ----------------------------------------------------
+      // Three-Tier Fallback Image Resolution:
+      // Tier 2: Selected Product Catalog Image (Strict Absolute HTTPS & Publicly Reachable)
+      // Tier 3: Verified Califnco Brand Asset Pool
+      // ----------------------------------------------------
+      const fallback = await resolveFallbackImageBuffer(selectedProduct);
+      if (!fallback) {
+        throw new Error('All image generation and verified fallback sources failed. Halting pipeline.');
+      }
+
+      imageBuffer = fallback.imageBuffer;
+      imageProvider = fallback.source === 'catalog-image' ? 'catalog-fallback' : 'brand-asset-pool';
+      console.log(`[Automation] Fallback image resolved from ${fallback.source}: ${fallback.sourceUrl}`);
+    }
 
     // ----------------------------------------------------
     // STEP 6: Host Image on Verified Public HTTPS Endpoint
+    // Uploads buffer to Cloudinary and verifies public HTTPS access
     // ----------------------------------------------------
-    hostedResult = await hostPromotionalImage(imageResult.imageBuffer, imageResult.directPublicUrl);
+    hostedResult = await hostPromotionalImage(imageBuffer, directPublicUrl);
     console.log(`[Automation] Image hosted on verified public URL via: ${hostedResult.provider}`);
 
     // Verify absolute public HTTPS URL before publishing
@@ -414,10 +445,9 @@ export async function executeDailyInstagramPosting(
       fullInstagramText: `Discover ${selectedProduct.name} at Califnco.\n\n#Califnco #WaterPurifier`,
       provider: 'califnco-template-engine',
     };
-    const safeProductImageUrl = isPublicHttpsUrl(selectedProduct.imageUrl) ? selectedProduct.imageUrl : '';
     hostedResult = hostedResult! || {
-      publicUrl: safeProductImageUrl,
-      provider: safeProductImageUrl ? 'direct-public-url' : 'none',
+      publicUrl: '',
+      provider: 'none',
       verified: false,
     };
     publishResult = {
@@ -448,7 +478,7 @@ export async function executeDailyInstagramPosting(
     status: runStatus,
     providers: {
       llm: captionResult.provider,
-      image: imageResult?.provider || 'none',
+      image: imageProvider,
       hosting: hostedResult.provider,
       publishing: 'instagram-graph-api-v21.0',
     },
