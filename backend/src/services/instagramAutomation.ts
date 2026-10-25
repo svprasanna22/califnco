@@ -6,7 +6,7 @@ import {
   type GeneratedCaptionResult,
 } from './aiCaptionService';
 import { generatePromotionalImage, type GeneratedImageResult } from './aiImageService';
-import { hostPromotionalImage, type HostedImageResult } from './imageHostingService';
+import { hostPromotionalImage, isPublicHttpsUrl, type HostedImageResult } from './imageHostingService';
 import {
   publishToInstagramGraphApi,
   refreshInstagramLongLivedToken,
@@ -91,14 +91,18 @@ export async function ensureValidInstagramToken(): Promise<{ ready: boolean; err
         }
 
         // 3. Persist ONLY non-sensitive metadata in Firestore (never the secret token string)
-        await db.collection('automation_state').doc('instagram_automation').set(
-          {
-            tokenLastRefreshedAt: new Date(now).toISOString(),
-            tokenExpiresAt: newExpiresAt,
-            tokenExpiresInDays: expiresInDays,
-          },
-          { merge: true }
-        );
+        try {
+          await db.collection('automation_state').doc('instagram_automation').set(
+            {
+              tokenLastRefreshedAt: new Date(now).toISOString(),
+              tokenExpiresAt: newExpiresAt,
+              tokenExpiresInDays: expiresInDays,
+            },
+            { merge: true }
+          );
+        } catch (metaErr) {
+          console.warn('[Token Guard] Renewed token encrypted and persisted to vault, but metadata update in automation_state failed:', metaErr);
+        }
 
         console.log(`[Token Guard] Instagram token successfully refreshed. Extended for ~${expiresInDays} days.`);
         return { ready: true };
@@ -380,6 +384,11 @@ export async function executeDailyInstagramPosting(
     hostedResult = await hostPromotionalImage(imageResult.imageBuffer, imageResult.directPublicUrl);
     console.log(`[Automation] Image hosted on verified public URL via: ${hostedResult.provider}`);
 
+    // Verify absolute public HTTPS URL before publishing
+    if (!isPublicHttpsUrl(hostedResult.publicUrl)) {
+      throw new Error(`Cannot publish: image URL "${hostedResult.publicUrl}" is not a verified public HTTPS URL.`);
+    }
+
     // ----------------------------------------------------
     // STEP 7: Publish to Meta Instagram Graph API
     // ----------------------------------------------------
@@ -405,9 +414,10 @@ export async function executeDailyInstagramPosting(
       fullInstagramText: `Discover ${selectedProduct.name} at Califnco.\n\n#Califnco #WaterPurifier`,
       provider: 'califnco-template-engine',
     };
+    const safeProductImageUrl = isPublicHttpsUrl(selectedProduct.imageUrl) ? selectedProduct.imageUrl : '';
     hostedResult = hostedResult! || {
-      publicUrl: selectedProduct.imageUrl || '',
-      provider: 'direct-public-url',
+      publicUrl: safeProductImageUrl,
+      provider: safeProductImageUrl ? 'direct-public-url' : 'none',
       verified: false,
     };
     publishResult = {

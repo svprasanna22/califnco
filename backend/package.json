@@ -9,7 +9,8 @@
     "dev": "ts-node src/server.ts",
     "test:payments": "npm run build && node dist/test/payment.test.js",
     "test:automation": "npm run build && node dist/test/automation.test.js",
-    "test": "npm run build && node dist/test/payment.test.js && node dist/test/automation.test.js"
+    "test": "npm run build && node dist/test/payment.test.js && node dist/test/automation.test.js",
+    "vault:update": "ts-node src/scripts/updateVaultToken.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",

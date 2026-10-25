@@ -1,4 +1,5 @@
 import { config } from '../config';
+import { isPublicHttpsUrl } from './imageHostingService';
 
 export interface InstagramPublishResult {
   status: 'published' | 'awaiting_credentials' | 'failed';
@@ -44,11 +45,14 @@ export interface InstagramTokenVerificationResult {
   valid: boolean;
   accountId?: string;
   username?: string;
+  permissions?: string[];
+  hasPublishPermission?: boolean;
   error?: string;
 }
 
 /**
- * Performs a read-only request to confirm Instagram currently accepts the access token.
+ * Performs a read-only request to confirm Instagram currently accepts the access token
+ * and checks content publishing permissions where supported by Meta.
  * The token is never included in logs or returned in the result.
  * An optional fetch implementation is provided for deterministic unit tests.
  */
@@ -68,7 +72,10 @@ export async function verifyInstagramAccessToken(
   verificationUrl.searchParams.set('access_token', token);
 
   try {
-    const response = await fetcher(verificationUrl.toString(), { method: 'GET' });
+    const response = await fetcher(verificationUrl.toString(), {
+      method: 'GET',
+      signal: AbortSignal.timeout(10000),
+    });
     const data: any = await response.json().catch(() => ({}));
     const accountId = data?.user_id ?? data?.id;
 
@@ -82,10 +89,58 @@ export async function verifyInstagramAccessToken(
       };
     }
 
+    // Query permissions endpoint where supported (e.g. Meta Graph API / Facebook Login)
+    let permissions: string[] | undefined;
+    let hasPublishPermission = true;
+
+    try {
+      const permsUrl = new URL(`${baseUrl}/me/permissions`);
+      permsUrl.searchParams.set('access_token', token);
+      const permsRes = await fetcher(permsUrl.toString(), {
+        method: 'GET',
+        signal: AbortSignal.timeout(5000),
+      });
+
+      if (permsRes.ok) {
+        const permsData: any = await permsRes.json().catch(() => ({}));
+        if (Array.isArray(permsData?.data)) {
+          const allEntries = permsData.data;
+          const grantedPermissions = allEntries
+            .filter((p: any) => p.status === 'granted')
+            .map((p: any) => String(p.permission));
+          permissions = grantedPermissions;
+
+          const hasPublish = grantedPermissions.some(
+            (p: string) =>
+              p.includes('content_publish') ||
+              p.includes('publish_actions') ||
+              p.includes('pages_manage_posts')
+          );
+
+          if (!hasPublish && allEntries.length > 0) {
+            hasPublishPermission = false;
+            return {
+              valid: false,
+              accountId: String(accountId),
+              ...(typeof data?.username === 'string' ? { username: data.username } : {}),
+              permissions: grantedPermissions,
+              hasPublishPermission: false,
+              error: `Token authenticated as @${data?.username || accountId}, but lacks content-publishing permission (granted: ${grantedPermissions.length > 0 ? grantedPermissions.join(', ') : 'none'}). Required: instagram_content_publish.`,
+            };
+          }
+        }
+      }
+    } catch {
+      // Non-fatal: Some token scopes do not expose /me/permissions.
+      // Fallback gracefully to successful /me identity verification.
+    }
+
     return {
       valid: true,
       accountId: String(accountId),
       ...(typeof data?.username === 'string' ? { username: data.username } : {}),
+      ...(permissions ? { permissions } : {}),
+      hasPublishPermission,
     };
   } catch {
     return { valid: false, error: 'Could not reach Instagram to verify the access token.' };
@@ -179,6 +234,15 @@ export async function publishToInstagramGraphApi(
   caption: string,
   options: { isDryRun?: boolean } = {}
 ): Promise<InstagramPublishResult> {
+  // Guard 0: Absolute Public HTTPS Image URL Guard
+  // Never attempt publishing (even simulated or dry-run) with a relative path or non-HTTPS URL
+  if (!isPublicHttpsUrl(imageUrl)) {
+    return {
+      status: 'failed',
+      errorMessage: `Publishing requires a valid public HTTPS image URL, received: "${imageUrl}".`,
+    };
+  }
+
   const rawAccountId = config.instagramAccountId?.trim();
   const accessToken = config.instagramAccessToken?.trim();
 
