@@ -22,15 +22,20 @@ import {
   hostPromotionalImage,
   uploadToCloudinary,
 } from '../services/imageHostingService';
+import { db } from '../firebase';
 import {
   publishToInstagramGraphApi,
   getInstagramApiBaseUrl,
   refreshInstagramLongLivedToken,
   verifyInstagramAccessToken,
+  reconcileInstagramPublication,
 } from '../services/instagramPublishService';
 import {
   getCurrentDateKey,
   ensureValidInstagramToken,
+  acquireDailyPostingLock,
+  retryInstagramPost,
+  reconcilePostRecord,
 } from '../services/instagramAutomation';
 import {
   encryptSecret,
@@ -829,7 +834,532 @@ async function runAutomationTests() {
   assert(exhaustedFallback === null, 'resolveFallbackImageBuffer must return null when all tiers fail');
   console.log('   [PASS] Exhaustion of all fallback tiers returns null and allows pipeline to fail closed cleanly');
 
-  console.log('\n--- All 25 AI Instagram Automation Unit Tests Passed Successfully! ---');
+  // Test 26: Ambiguous media_publish timeout and 5xx response handling
+  console.log('\n26. Testing ambiguous media_publish timeout and 5xx response handling...');
+  const prevDryRun26 = config.instagramDryRun;
+  const prevEnvDryRun26 = process.env.INSTAGRAM_DRY_RUN;
+  const prevToken26 = config.instagramAccessToken;
+
+  try {
+    config.instagramDryRun = false;
+    process.env.INSTAGRAM_DRY_RUN = 'false';
+    config.instagramAccessToken = 'IGQVJ_test_timeout_token_999';
+
+    // 26.1: Timeout-after-request on media_publish
+    let containerCreateCalls = 0;
+    const timeoutFetcher = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const urlStr = String(input);
+      if (urlStr.includes('/media') && !urlStr.includes('/media_publish') && init?.method === 'POST') {
+        containerCreateCalls++;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: 'container_timeout_123' }),
+        } as any;
+      }
+      if (urlStr.includes('container_timeout_123') && urlStr.includes('fields=status_code')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ status_code: 'FINISHED' }),
+        } as any;
+      }
+      if (urlStr.includes('/media_publish') && init?.method === 'POST') {
+        // Simulate network timeout after media_publish request was sent
+        throw new Error('The operation was aborted due to timeout');
+      }
+      return { ok: false, status: 404 } as any;
+    };
+
+    const timeoutResult = await publishToInstagramGraphApi(
+      validImageUrl,
+      captionResult.fullInstagramText,
+      { isDryRun: false },
+      timeoutFetcher as any
+    );
+
+    assert(timeoutResult.status === 'publication_unknown', 'Must return publication_unknown on media_publish timeout');
+    assert(timeoutResult.containerId === 'container_timeout_123', 'Must preserve container ID for tracking');
+    assert(timeoutResult.errorMessage?.includes('Ambiguous network error or timeout'), 'Must return descriptive advisory error');
+    assert(containerCreateCalls === 1, 'Must NOT attempt to create another container on timeout');
+    console.log('   [PASS] Network timeout on media_publish returns publication_unknown without creating second container');
+
+    // 26.2: Ambiguous HTTP 502/503 response from Meta on media_publish
+    let container502Calls = 0;
+    const gateway502Fetcher = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const urlStr = String(input);
+      if (urlStr.includes('/media') && !urlStr.includes('/media_publish') && init?.method === 'POST') {
+        container502Calls++;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: 'container_502_456' }),
+        } as any;
+      }
+      if (urlStr.includes('container_502_456') && urlStr.includes('fields=status_code')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ status_code: 'FINISHED' }),
+        } as any;
+      }
+      if (urlStr.includes('/media_publish') && init?.method === 'POST') {
+        return {
+          ok: false,
+          status: 502,
+          text: async () => '502 Bad Gateway from Meta Edge',
+        } as any;
+      }
+      return { ok: false, status: 404 } as any;
+    };
+
+    const gatewayResult = await publishToInstagramGraphApi(
+      validImageUrl,
+      captionResult.fullInstagramText,
+      { isDryRun: false },
+      gateway502Fetcher as any
+    );
+
+    assert(gatewayResult.status === 'publication_unknown', 'Must return publication_unknown on HTTP 502');
+    assert(gatewayResult.containerId === 'container_502_456', 'Must preserve container ID for tracking');
+    assert(gatewayResult.errorMessage?.includes('Ambiguous HTTP 502'), 'Must report 502 status');
+    assert(container502Calls === 1, 'Must NOT create duplicate containers on 5xx response');
+    console.log('   [PASS] Ambiguous 502/5xx response from Meta returns publication_unknown');
+
+    // 26.3: Definite HTTP 400 error returns failed (NOT publication_unknown)
+    const clientErrFetcher = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const urlStr = String(input);
+      if (urlStr.includes('/media') && !urlStr.includes('/media_publish') && init?.method === 'POST') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: 'container_400_789' }),
+        } as any;
+      }
+      if (urlStr.includes('container_400_789') && urlStr.includes('fields=status_code')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ status_code: 'FINISHED' }),
+        } as any;
+      }
+      if (urlStr.includes('/media_publish') && init?.method === 'POST') {
+        return {
+          ok: false,
+          status: 400,
+          json: async () => ({ error: { message: 'Invalid media container' } }),
+        } as any;
+      }
+      return { ok: false, status: 404 } as any;
+    };
+
+    const clientErrResult = await publishToInstagramGraphApi(
+      validImageUrl,
+      captionResult.fullInstagramText,
+      { isDryRun: false },
+      clientErrFetcher as any
+    );
+
+    assert(clientErrResult.status === 'failed', 'Definite 400 client error must return status failed, not publication_unknown');
+    assert(clientErrResult.errorMessage?.includes('Invalid media container'), 'Must preserve Meta error message');
+    console.log('   [PASS] Definite 4xx client errors return status failed without ambiguous classification');
+  } finally {
+    config.instagramDryRun = prevDryRun26;
+    process.env.INSTAGRAM_DRY_RUN = prevEnvDryRun26;
+    config.instagramAccessToken = prevToken26;
+  }
+
+  // Test 27: Instagram Reconciliation Mechanism
+  console.log('\n27. Testing safe Instagram publication reconciliation...');
+  const prevToken27 = config.instagramAccessToken;
+
+  try {
+    config.instagramAccessToken = 'IGQVJ_test_reconcile_token_777';
+
+    // 27.1: Reconciliation Success (evidence of post found on Instagram account)
+    const successFetcher = async (input: RequestInfo | URL) => {
+      const urlStr = String(input);
+      if (urlStr.includes('/me?') && !urlStr.includes('/media')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: '17841400000000000', username: 'califnco.water' }),
+        } as any;
+      }
+      if (urlStr.includes('/media') && !urlStr.includes('/media_publish')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: [
+              {
+                id: 'ig_media_reconciled_101',
+                caption: 'Discover Califnco Stellar 8-Stage Smart RO at Califnco. Pure healthy water.\n\n#Califnco',
+                permalink: 'https://www.instagram.com/p/ig_media_reconciled_101/',
+                timestamp: new Date().toISOString(),
+              },
+            ],
+          }),
+        } as any;
+      }
+      return { ok: false, status: 404 } as any;
+    };
+
+    const reconSuccess = await reconcileInstagramPublication(
+      'Discover Califnco Stellar 8-Stage Smart RO',
+      successFetcher as any
+    );
+
+    assert(reconSuccess.reconciled === true, 'Reconciliation must succeed when matching post is found');
+    assert(reconSuccess.status === 'published', 'Status must be updated to published upon reconciliation');
+    assert(reconSuccess.mediaId === 'ig_media_reconciled_101', 'Must retrieve matching mediaId');
+    assert(reconSuccess.permalink === 'https://www.instagram.com/p/ig_media_reconciled_101/', 'Must retrieve matching permalink');
+    console.log('   [PASS] Reconciliation successfully matches recent Instagram post and confirms published status');
+
+    // 27.2: Reconciliation Failure / Unconfirmed (no matching post found)
+    const notFoundFetcher = async (input: RequestInfo | URL) => {
+      const urlStr = String(input);
+      if (urlStr.includes('/me?') && !urlStr.includes('/media')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: '17841400000000000', username: 'califnco.water' }),
+        } as any;
+      }
+      if (urlStr.includes('/media') && !urlStr.includes('/media_publish')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: [
+              {
+                id: 'ig_media_unrelated_202',
+                caption: 'Summer hydration tips and recipes for the family.',
+                permalink: 'https://www.instagram.com/p/ig_media_unrelated_202/',
+                timestamp: new Date().toISOString(),
+              },
+            ],
+          }),
+        } as any;
+      }
+      return { ok: false, status: 404 } as any;
+    };
+
+    const reconNotFound = await reconcileInstagramPublication(
+      'Discover Califnco Stellar 8-Stage Smart RO',
+      notFoundFetcher as any
+    );
+
+    assert(reconNotFound.reconciled === false, 'Reconciliation must not report success when post is absent');
+    assert(reconNotFound.status === 'publication_unknown', 'Status must remain publication_unknown');
+    assert(reconNotFound.errorMessage?.includes('Manual confirmation on @califnco.water required'), 'Must require manual verification');
+    console.log('   [PASS] Reconciliation fails closed when post is absent and requires manual confirmation');
+
+    // 27.3: Reconciliation Network Error (fail-closed guard)
+    const errorFetcher = async () => {
+      throw new Error('Network connection dropped');
+    };
+
+    const reconError = await reconcileInstagramPublication(
+      'Discover Califnco Stellar 8-Stage Smart RO',
+      errorFetcher as any
+    );
+
+    assert(reconError.reconciled === false, 'Reconciliation must fail closed on network error');
+    assert(reconError.status === 'publication_unknown', 'Status must remain publication_unknown');
+    assert(reconError.errorMessage?.includes('Fails closed'), 'Must explicitly indicate fail-closed behavior');
+    console.log('   [PASS] Reconciliation network failure fails closed safely without assuming outcome');
+
+    // 27.4: Timestamp window filtering rejects older post with matching caption
+    const oldPostFetcher = async (input: RequestInfo | URL) => {
+      const urlStr = String(input);
+      if (urlStr.includes('/me?') && !urlStr.includes('/media')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: '17841400000000000', username: 'califnco.water' }),
+        } as any;
+      }
+      if (urlStr.includes('/media') && !urlStr.includes('/media_publish')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: [
+              {
+                id: 'ig_media_old_999',
+                caption: 'Discover Califnco Stellar 8-Stage Smart RO at Califnco.\n\n#Califnco',
+                permalink: 'https://www.instagram.com/p/ig_media_old_999/',
+                timestamp: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString(), // 3 days ago
+              },
+            ],
+          }),
+        } as any;
+      }
+      return { ok: false, status: 404 } as any;
+    };
+
+    const reconOld = await reconcileInstagramPublication(
+      'Discover Califnco Stellar 8-Stage Smart RO',
+      oldPostFetcher as any,
+      Date.now() - 24 * 60 * 60 * 1000 // Last 24 hours only
+    );
+
+    assert(reconOld.reconciled === false, 'Older post beyond the timestamp window must not be falsely reconciled');
+    assert(reconOld.status === 'publication_unknown', 'Status must remain publication_unknown');
+    console.log('   [PASS] Reconciliation correctly skips older posts beyond the timestamp window');
+  } finally {
+    config.instagramAccessToken = prevToken27;
+  }
+
+  // Test 28: Duplicate Prevention on Retries and Idempotency Protections
+  console.log('\n28. Testing duplicate prevention on retries and idempotency protections...');
+
+  const mockStore: Record<string, Map<string, any>> = {
+    instagram_posts: new Map(),
+    automation_locks: new Map(),
+  };
+
+  const originalCollection = db.collection.bind(db);
+  const originalRunTransaction = db.runTransaction.bind(db);
+  const originalBatch = db.batch.bind(db);
+
+  (db as any).collection = (collName: string) => {
+    if (!mockStore[collName]) mockStore[collName] = new Map();
+    return {
+      doc: (docId: string) => ({
+        id: docId,
+        get: async () => {
+          const data = mockStore[collName].get(docId);
+          return {
+            exists: !!data,
+            id: docId,
+            data: () => data,
+          };
+        },
+        set: async (data: any, options?: any) => {
+          if (options?.merge && mockStore[collName].has(docId)) {
+            mockStore[collName].set(docId, { ...mockStore[collName].get(docId), ...data });
+          } else {
+            mockStore[collName].set(docId, data);
+          }
+        },
+        update: async (data: any) => {
+          const existing = mockStore[collName].get(docId) || {};
+          mockStore[collName].set(docId, { ...existing, ...data });
+        },
+      }),
+    } as any;
+  };
+
+  (db as any).runTransaction = async (updateFunction: (transaction: any) => Promise<any>) => {
+    const transaction = {
+      get: async (docRef: any) => docRef.get(),
+      set: async (docRef: any, data: any, options?: any) => docRef.set(data, options),
+      update: async (docRef: any, data: any) => docRef.update(data),
+    };
+    return updateFunction(transaction);
+  };
+
+  (db as any).batch = () => {
+    const ops: Array<() => Promise<any>> = [];
+    return {
+      update: (docRef: any, data: any) => {
+        ops.push(async () => docRef.update(data));
+      },
+      set: (docRef: any, data: any, options?: any) => {
+        ops.push(async () => docRef.set(data, options));
+      },
+      commit: async () => {
+        for (const op of ops) {
+          await op();
+        }
+      },
+    };
+  };
+
+  try {
+    // 28.1: Retry on already published post is strictly rejected
+    mockStore.instagram_posts.set('post_already_published_01', {
+      id: 'post_already_published_01',
+      status: 'published',
+      instagramMediaId: 'existing_media_888',
+      imageUrl: validImageUrl,
+      fullInstagramText: 'Sample text',
+    });
+
+    let retryPublishedBlocked = false;
+    try {
+      await retryInstagramPost('post_already_published_01');
+    } catch (err: any) {
+      retryPublishedBlocked = true;
+      assert(err.message.includes('already confirmed as published'), 'Must throw descriptive duplicate prevention error');
+    }
+    assert(retryPublishedBlocked === true, 'retryInstagramPost must reject retry on already published post');
+    console.log('   [PASS] Retry on already published post blocked to prevent duplicate posts');
+
+    // 28.1b: Concurrent retries: retry_in_progress blocks duplicate concurrent retry attempts
+    mockStore.instagram_posts.set('post_concurrent_retry_01', {
+      id: 'post_concurrent_retry_01',
+      status: 'retry_in_progress',
+      completedAt: new Date().toISOString(),
+      imageUrl: validImageUrl,
+      fullInstagramText: 'Sample text',
+    });
+
+    let concurrentRetryBlocked = false;
+    try {
+      await retryInstagramPost('post_concurrent_retry_01');
+    } catch (err: any) {
+      concurrentRetryBlocked = true;
+      assert(err.message.includes('another retry execution is currently in progress'), 'Must block concurrent retry');
+    }
+    assert(concurrentRetryBlocked === true, 'retryInstagramPost must block concurrent retry when retry_in_progress');
+    console.log('   [PASS] Concurrent retry blocked while an existing retry execution is in progress');
+
+    // 28.2: Retry on publication_unknown post when reconciliation confirms published post
+    mockStore.instagram_posts.set('post_unknown_found_02', {
+      id: 'post_unknown_found_02',
+      dateKey: '2026-10-25',
+      status: 'publication_unknown',
+      imageUrl: validImageUrl,
+      caption: 'Discover Califnco Stellar 8-Stage Smart RO',
+      fullInstagramText: 'Discover Califnco Stellar 8-Stage Smart RO at Califnco.\n\n#Califnco',
+    });
+
+    const mockReconcileFoundFetcher = async (input: RequestInfo | URL) => {
+      const urlStr = String(input);
+      if (urlStr.includes('/me?') && !urlStr.includes('/media')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: '17841400000000000', username: 'califnco.water' }),
+        } as any;
+      }
+      if (urlStr.includes('/media') && !urlStr.includes('/media_publish')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: [
+              {
+                id: 'ig_media_recon_333',
+                caption: 'Discover Califnco Stellar 8-Stage Smart RO at Califnco.\n\n#Califnco',
+                permalink: 'https://www.instagram.com/p/ig_media_recon_333/',
+              },
+            ],
+          }),
+        } as any;
+      }
+      return { ok: false, status: 404 } as any;
+    };
+
+    const prevToken28 = config.instagramAccessToken;
+    config.instagramAccessToken = 'IGQVJ_test_token_28';
+
+    const recoveredRecord = await retryInstagramPost(
+      'post_unknown_found_02',
+      mockReconcileFoundFetcher as any
+    );
+
+    assert(recoveredRecord.status === 'published', 'Post status must be updated to published upon reconciliation');
+    assert(recoveredRecord.instagramMediaId === 'ig_media_recon_333', 'Media ID must be updated from reconciled post');
+    const updatedStoredDoc = mockStore.instagram_posts.get('post_unknown_found_02');
+    assert(updatedStoredDoc?.status === 'published', 'Stored document must be updated to published');
+    const updatedStoredLock = mockStore.automation_locks.get('2026-10-25');
+    assert(updatedStoredLock?.status === 'published', 'Daily lock must be sealed as published');
+    console.log('   [PASS] Retry on publication_unknown safely reconciles existing post without republishing');
+
+    // 28.3: Retry on publication_unknown post when reconciliation CANNOT confirm post
+    mockStore.instagram_posts.set('post_unknown_unconfirmed_03', {
+      id: 'post_unknown_unconfirmed_03',
+      dateKey: '2026-10-26',
+      status: 'publication_unknown',
+      imageUrl: validImageUrl,
+      caption: 'Discover Califnco Stellar 8-Stage Smart RO',
+      fullInstagramText: 'Discover Califnco Stellar 8-Stage Smart RO',
+    });
+
+    const mockReconcileUnconfirmedFetcher = async (input: RequestInfo | URL) => {
+      const urlStr = String(input);
+      if (urlStr.includes('/me?') && !urlStr.includes('/media')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: '17841400000000000', username: 'califnco.water' }),
+        } as any;
+      }
+      if (urlStr.includes('/media') && !urlStr.includes('/media_publish')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: [] }),
+        } as any;
+      }
+      return { ok: false, status: 404 } as any;
+    };
+
+    let retryUnconfirmedBlocked = false;
+    try {
+      await retryInstagramPost(
+        'post_unknown_unconfirmed_03',
+        mockReconcileUnconfirmedFetcher as any
+      );
+    } catch (err: any) {
+      retryUnconfirmedBlocked = true;
+      assert(err.message.includes('Manual verification on @califnco.water required before retrying'), 'Must require manual verification');
+    }
+    assert(retryUnconfirmedBlocked === true, 'retryInstagramPost must fail closed when reconciliation cannot confirm post');
+    console.log('   [PASS] Retry on publication_unknown fails closed and forbids duplicate post creation when unconfirmed');
+
+    // 28.4: Repeat retry attempts cannot bypass protection
+    let secondRetryBlocked = false;
+    try {
+      await retryInstagramPost(
+        'post_unknown_unconfirmed_03',
+        mockReconcileUnconfirmedFetcher as any
+      );
+    } catch (err: any) {
+      secondRetryBlocked = true;
+      assert(err.message.includes('Manual verification on @califnco.water required'), 'Second retry must also fail closed');
+    }
+    assert(secondRetryBlocked === true, 'Repeated retry attempts must continue to fail closed');
+    console.log('   [PASS] Repeat retry attempts cannot bypass protection or trigger unverified publishing');
+
+    // 28.5: Daily lock protection: publication_unknown blocks new un-forced runs
+    mockStore.automation_locks.set('2026-10-27', {
+      dateKey: '2026-10-27',
+      runId: 'run_ambiguous_lock_01',
+      status: 'publication_unknown',
+    });
+
+    const lockAttempt = await acquireDailyPostingLock('2026-10-27', 'run_new_attempt_02', false);
+    assert(lockAttempt.acquired === false, 'Daily lock must reject new runs when in publication_unknown state');
+    assert(lockAttempt.reason?.includes('publication_unknown state'), 'Must provide clear reason about ambiguous state');
+    console.log('   [PASS] Daily lock protects against new runs while publication status is ambiguous');
+
+    // 28.5b: Daily lock protection: force=true CANNOT bypass publication_unknown lock
+    const forceAttempt = await acquireDailyPostingLock('2026-10-27', 'run_forced_bypass_attempt', true);
+    assert(forceAttempt.acquired === false, 'force=true must NOT bypass publication_unknown state');
+    assert(forceAttempt.reason?.includes('publication_unknown state'), 'Must provide clear reason about ambiguous state');
+    console.log('   [PASS] force=true is strictly blocked from bypassing publication_unknown locks');
+
+    // 28.6: Endpoint reconciliation helper (reconcilePostRecord)
+    const reconcileHelperSuccess = await reconcilePostRecord('post_unknown_found_02', mockReconcileFoundFetcher as any);
+    assert(reconcileHelperSuccess.reconciled === true, 'reconcilePostRecord must return reconciled true for confirmed post');
+
+    const reconcileHelperUnconfirmed = await reconcilePostRecord('post_unknown_unconfirmed_03', mockReconcileUnconfirmedFetcher as any);
+    assert(reconcileHelperUnconfirmed.reconciled === false, 'reconcilePostRecord must return reconciled false when unconfirmed');
+    console.log('   [PASS] reconcilePostRecord endpoint handler correctly reports reconciliation status');
+
+    config.instagramAccessToken = prevToken28;
+  } finally {
+    (db as any).collection = originalCollection;
+    (db as any).runTransaction = originalRunTransaction;
+    (db as any).batch = originalBatch;
+  }
+
+  console.log('\n--- All 28 AI Instagram Automation Unit Tests Passed Successfully! ---');
 }
 
 runAutomationTests().catch((err) => {

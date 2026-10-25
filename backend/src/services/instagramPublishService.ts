@@ -2,13 +2,22 @@ import { config } from '../config';
 import { isPublicHttpsUrl } from './imageHostingService';
 
 export interface InstagramPublishResult {
-  status: 'published' | 'awaiting_credentials' | 'failed';
+  status: 'published' | 'awaiting_credentials' | 'failed' | 'publication_unknown';
   mediaId?: string;
   permalink?: string;
   containerId?: string;
   errorMessage?: string;
   publishedAt?: string;
   isMockOrDryRun?: boolean;
+}
+
+export interface InstagramReconciliationResult {
+  reconciled: boolean;
+  status: 'published' | 'publication_unknown';
+  mediaId?: string;
+  permalink?: string;
+  errorMessage?: string;
+  checkedAt: string;
 }
 
 export interface TokenRefreshResult {
@@ -153,7 +162,8 @@ export async function verifyInstagramAccessToken(
 async function resolveInstagramAccountId(
   rawAccountId: string,
   accessToken: string,
-  baseUrl: string
+  baseUrl: string,
+  fetcher: typeof fetch = fetch
 ): Promise<string> {
   let cleaned = rawAccountId.trim();
   if (cleaned.startsWith('@')) {
@@ -168,7 +178,7 @@ async function resolveInstagramAccountId(
   // Attempt to resolve /me from the API
   try {
     const meUrl = `${baseUrl}/me?fields=id,username&access_token=${accessToken}`;
-    const res = await fetch(meUrl);
+    const res = await fetcher(meUrl);
     if (res.ok) {
       const data: any = await res.json();
       if (data?.id) {
@@ -232,7 +242,8 @@ export async function refreshInstagramLongLivedToken(
 export async function publishToInstagramGraphApi(
   imageUrl: string,
   caption: string,
-  options: { isDryRun?: boolean } = {}
+  options: { isDryRun?: boolean } = {},
+  fetcher: typeof fetch = fetch
 ): Promise<InstagramPublishResult> {
   // Guard 0: Absolute Public HTTPS Image URL Guard
   // Never attempt publishing (even simulated or dry-run) with a relative path or non-HTTPS URL
@@ -273,7 +284,7 @@ export async function publishToInstagramGraphApi(
   }
 
   const BASE_URL = getInstagramApiBaseUrl(accessToken);
-  const accountId = await resolveInstagramAccountId(rawAccountId || 'me', accessToken, BASE_URL);
+  const accountId = await resolveInstagramAccountId(rawAccountId || 'me', accessToken, BASE_URL, fetcher);
 
   try {
     // ----------------------------------------------------
@@ -285,7 +296,7 @@ export async function publishToInstagramGraphApi(
     containerUrl.searchParams.set('caption', caption);
     containerUrl.searchParams.set('access_token', accessToken);
 
-    const containerResponse = await fetch(containerUrl.toString(), {
+    const containerResponse = await fetcher(containerUrl.toString(), {
       method: 'POST',
     });
 
@@ -312,7 +323,7 @@ export async function publishToInstagramGraphApi(
     while (!isReady && attempts < 5) {
       attempts++;
       const statusUrl = `${BASE_URL}/${containerId}?fields=status_code&access_token=${accessToken}`;
-      const statusRes = await fetch(statusUrl);
+      const statusRes = await fetcher(statusUrl);
       if (statusRes.ok) {
         const statusJson: any = await statusRes.json();
         if (statusJson?.status_code === 'FINISHED') {
@@ -337,11 +348,34 @@ export async function publishToInstagramGraphApi(
     publishUrl.searchParams.set('creation_id', containerId);
     publishUrl.searchParams.set('access_token', accessToken);
 
-    const publishResponse = await fetch(publishUrl.toString(), {
-      method: 'POST',
-    });
+    let publishResponse: Response;
+    try {
+      publishResponse = await fetcher(publishUrl.toString(), {
+        method: 'POST',
+        signal: AbortSignal.timeout(30000),
+      });
+    } catch (networkErr: unknown) {
+      // Ambiguous timeout or network error after media_publish was dispatched to Meta
+      console.error('[Instagram API] Ambiguous network timeout/error during media_publish:', networkErr);
+      return {
+        status: 'publication_unknown',
+        containerId,
+        errorMessage: `Ambiguous network error or timeout during media_publish: ${(networkErr as Error)?.message || networkErr}. The post may have been published on Instagram. Reconcile account media before retrying.`,
+      };
+    }
 
-    const publishData: any = await publishResponse.json();
+    // Check for 5xx Gateway / Ambiguous server responses from Meta
+    if (publishResponse.status >= 500) {
+      const errText = await publishResponse.text().catch(() => '');
+      console.error(`[Instagram API] Ambiguous HTTP ${publishResponse.status} during media_publish: ${errText}`);
+      return {
+        status: 'publication_unknown',
+        containerId,
+        errorMessage: `Ambiguous HTTP ${publishResponse.status} response from Meta during media_publish. The post may have been published on Instagram. Reconcile account media before retrying.`,
+      };
+    }
+
+    const publishData: any = await publishResponse.json().catch(() => ({}));
 
     if (!publishResponse.ok || !publishData?.id) {
       const errorMsg = publishData?.error?.message || 'Failed to publish Instagram media container.';
@@ -362,7 +396,7 @@ export async function publishToInstagramGraphApi(
     let permalink: string | undefined;
     try {
       const detailsUrl = `${BASE_URL}/${mediaId}?fields=id,permalink,timestamp&access_token=${accessToken}`;
-      const detailsRes = await fetch(detailsUrl);
+      const detailsRes = await fetcher(detailsUrl);
       if (detailsRes.ok) {
         const detailsJson: any = await detailsRes.json();
         permalink = detailsJson?.permalink;
@@ -374,7 +408,7 @@ export async function publishToInstagramGraphApi(
     return {
       status: 'published',
       mediaId,
-      permalink,
+      permalink: permalink || `https://www.instagram.com/p/${mediaId}/`,
       containerId,
       publishedAt: new Date().toISOString(),
     };
@@ -384,6 +418,99 @@ export async function publishToInstagramGraphApi(
     return {
       status: 'failed',
       errorMessage: err?.message || 'Unexpected failure connecting to Meta Instagram Graph API.',
+    };
+  }
+}
+
+/**
+ * Safely reconciles an ambiguous publication_unknown post with the Instagram account.
+ * Queries recent account media to check if a post matching the caption was published.
+ */
+export async function reconcileInstagramPublication(
+  expectedCaptionSnippet: string,
+  fetcher: typeof fetch = fetch,
+  minTimestampMs: number = Date.now() - 24 * 60 * 60 * 1000
+): Promise<InstagramReconciliationResult> {
+  const rawAccountId = config.instagramAccountId?.trim();
+  const accessToken = config.instagramAccessToken?.trim();
+
+  if (!accessToken) {
+    return {
+      reconciled: false,
+      status: 'publication_unknown',
+      errorMessage: 'Cannot reconcile: Instagram access token is not configured.',
+      checkedAt: new Date().toISOString(),
+    };
+  }
+
+  const BASE_URL = getInstagramApiBaseUrl(accessToken);
+
+  try {
+    const accountId = await resolveInstagramAccountId(rawAccountId || 'me', accessToken, BASE_URL, fetcher);
+    const mediaListUrl = new URL(`${BASE_URL}/${accountId}/media`);
+    mediaListUrl.searchParams.set('fields', 'id,caption,media_type,permalink,timestamp');
+    mediaListUrl.searchParams.set('limit', '10');
+    mediaListUrl.searchParams.set('access_token', accessToken);
+
+    const response = await fetcher(mediaListUrl.toString(), {
+      method: 'GET',
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => '');
+      return {
+        reconciled: false,
+        status: 'publication_unknown',
+        errorMessage: `Failed to query Instagram recent media (HTTP ${response.status}): ${errText}`,
+        checkedAt: new Date().toISOString(),
+      };
+    }
+
+    const data: any = await response.json().catch(() => ({}));
+    const mediaItems: Array<{ id: string; caption?: string; permalink?: string; timestamp?: string }> = Array.isArray(data?.data) ? data.data : [];
+
+    // Clean and normalize target snippet for comparison
+    const targetSnippet = expectedCaptionSnippet.trim().toLowerCase().slice(0, 40);
+
+    const matchingMedia = mediaItems.find((item) => {
+      if (!item.caption) return false;
+
+      // 1. Timestamp window check: must not precede minTimestampMs
+      if (item.timestamp && minTimestampMs > 0) {
+        const itemTimeMs = new Date(item.timestamp).getTime();
+        if (!isNaN(itemTimeMs) && itemTimeMs < minTimestampMs) {
+          return false;
+        }
+      }
+
+      // 2. Strict unidirectional containment: item caption must contain target snippet
+      const itemCaption = item.caption.toLowerCase();
+      return itemCaption.includes(targetSnippet);
+    });
+
+    if (matchingMedia) {
+      return {
+        reconciled: true,
+        status: 'published',
+        mediaId: matchingMedia.id,
+        permalink: matchingMedia.permalink || `https://www.instagram.com/p/${matchingMedia.id}/`,
+        checkedAt: new Date().toISOString(),
+      };
+    }
+
+    return {
+      reconciled: false,
+      status: 'publication_unknown',
+      errorMessage: 'No matching post found in recent Instagram media. Status remains ambiguous. Manual confirmation on @califnco.water required before retrying.',
+      checkedAt: new Date().toISOString(),
+    };
+  } catch (err: unknown) {
+    return {
+      reconciled: false,
+      status: 'publication_unknown',
+      errorMessage: `Reconciliation network failure: ${(err as Error)?.message || err}. Fails closed.`,
+      checkedAt: new Date().toISOString(),
     };
   }
 }

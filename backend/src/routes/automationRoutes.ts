@@ -4,6 +4,7 @@ import { config, isCronSecretStrong } from '../config';
 import {
   executeDailyInstagramPosting,
   retryInstagramPost,
+  reconcilePostRecord,
   getCurrentDateKey,
 } from '../services/instagramAutomation';
 import { refreshInstagramLongLivedToken } from '../services/instagramPublishService';
@@ -183,6 +184,30 @@ automationRouter.post('/retry/:postId', requireAutomationAuth, async (req: Reque
   } catch (error: unknown) {
     const err = error as Error;
     res.status(500).json({ error: err?.message || 'Failed to retry post.' });
+  }
+});
+
+/**
+ * POST /api/automation/reconcile/:postId
+ * Reconciles an ambiguous publication_unknown post record against the Instagram account
+ */
+automationRouter.post('/reconcile/:postId', requireAutomationAuth, async (req: Request, res: Response) => {
+  try {
+    const { postId } = req.params;
+    if (!postId) {
+      return res.status(400).json({ error: 'Missing postId parameter.' });
+    }
+
+    const result = await reconcilePostRecord(postId);
+    res.status(200).json({
+      status: result.reconciled ? 'success' : 'unconfirmed',
+      reconciled: result.reconciled,
+      message: result.message,
+      record: result.record,
+    });
+  } catch (error: unknown) {
+    const err = error as Error;
+    res.status(500).json({ error: err?.message || 'Failed to reconcile post.' });
   }
 });
 

@@ -16,6 +16,7 @@ import {
   publishToInstagramGraphApi,
   refreshInstagramLongLivedToken,
   verifyInstagramAccessToken,
+  reconcileInstagramPublication,
   type InstagramPublishResult,
 } from './instagramPublishService';
 import { saveEncryptedTokenToVault } from './tokenVaultService';
@@ -25,6 +26,7 @@ export interface AutomationRunOptions {
   force?: boolean;
   isManualTrigger?: boolean;
   targetProductId?: string;
+  fetcher?: typeof fetch;
 }
 
 /**
@@ -149,7 +151,7 @@ export interface AutomationExecutionRecord {
   caption: string;
   hashtags: string[];
   fullInstagramText: string;
-  status: 'published' | 'awaiting_credentials' | 'failed';
+  status: 'published' | 'awaiting_credentials' | 'failed' | 'publication_unknown' | 'retry_in_progress';
   providers: {
     llm: string;
     image: string;
@@ -260,10 +262,6 @@ export async function acquireDailyPostingLock(
   runId: string,
   force?: boolean
 ): Promise<{ acquired: boolean; reason?: string; existingDocId?: string }> {
-  if (force) {
-    return { acquired: true };
-  }
-
   const lockRef = db.collection('automation_locks').doc(dateKey);
 
   return db.runTransaction(async (transaction) => {
@@ -272,8 +270,17 @@ export async function acquireDailyPostingLock(
     if (lockSnap.exists) {
       const data = lockSnap.data();
 
-      // 1. If already published for this dateKey, permanently seal it
-      if (data?.status === 'published') {
+      // 1. If post is in ambiguous publication_unknown state, NEVER bypass even with force=true
+      if (data?.status === 'publication_unknown') {
+        return {
+          acquired: false,
+          reason: `Post for date ${dateKey} is in ambiguous publication_unknown state. Must reconcile with Instagram account before new publication attempts.`,
+          existingDocId: data.runId,
+        };
+      }
+
+      // 2. If already published for this dateKey, permanently seal it (unless force is true)
+      if (data?.status === 'published' && !force) {
         return {
           acquired: false,
           reason: `Post already published for date ${dateKey}.`,
@@ -281,8 +288,8 @@ export async function acquireDailyPostingLock(
         };
       }
 
-      // 2. If in-progress, check lock lease duration (15 minutes)
-      if (data?.status === 'in_progress') {
+      // 3. If in-progress, check lock lease duration (15 minutes) unless force is true
+      if (data?.status === 'in_progress' && !force) {
         const lockedAtMs = new Date(data.lockedAt || 0).getTime();
         const isStale = Date.now() - lockedAtMs > 15 * 60 * 1000;
 
@@ -296,7 +303,7 @@ export async function acquireDailyPostingLock(
       }
     }
 
-    // 3. Atomically acquire lock
+    // 4. Atomically acquire lock
     transaction.set(
       lockRef,
       {
@@ -305,6 +312,7 @@ export async function acquireDailyPostingLock(
         status: 'in_progress',
         lockedAt: new Date().toISOString(),
         workerPid: process.pid,
+        ...(force ? { forced: true } : {}),
       },
       { merge: true }
     );
@@ -359,7 +367,7 @@ export async function executeDailyInstagramPosting(
   let imageProvider: string = 'none';
   let hostedResult: HostedImageResult | undefined;
   let publishResult: InstagramPublishResult | undefined;
-  let runStatus: 'published' | 'awaiting_credentials' | 'failed' = 'failed';
+  let runStatus: 'published' | 'awaiting_credentials' | 'failed' | 'publication_unknown' = 'failed';
   let errorDetails: string | undefined;
 
   try {
@@ -427,7 +435,8 @@ export async function executeDailyInstagramPosting(
     publishResult = await publishToInstagramGraphApi(
       hostedResult.publicUrl,
       captionResult.fullInstagramText,
-      { isDryRun }
+      { isDryRun },
+      options.fetcher
     );
     runStatus = publishResult.status;
     errorDetails = publishResult.errorMessage;
@@ -536,9 +545,186 @@ export async function executeDailyInstagramPosting(
 }
 
 /**
- * Retries a failed or awaiting_credentials post execution record
+ * Retries a failed or awaiting_credentials post execution record.
+ * Fails closed on publication_unknown or already published posts to prevent duplicate posts.
+ * Guards against concurrent retries and uses atomic Firestore batches for state synchronization.
  */
-export async function retryInstagramPost(postId: string): Promise<AutomationExecutionRecord> {
+export async function retryInstagramPost(
+  postId: string,
+  fetcher: typeof fetch = fetch
+): Promise<AutomationExecutionRecord> {
+  const docRef = db.collection('instagram_posts').doc(postId);
+
+  // Step 1: Transactional concurrency guard & status verification
+  const existingRecord = await db.runTransaction(async (transaction) => {
+    const snap = await transaction.get(docRef);
+    if (!snap.exists) {
+      throw new Error(`Execution record with ID "${postId}" not found.`);
+    }
+
+    const record = snap.data() as AutomationExecutionRecord;
+
+    // Reject retry if already confirmed as published
+    if (record.status === 'published') {
+      throw new Error(
+        `Cannot retry post "${postId}": post is already confirmed as published on Instagram (Media ID: ${record.instagramMediaId || 'unknown'}).`
+      );
+    }
+
+    // Prevent concurrent retries on the same post
+    if (record.status === 'retry_in_progress') {
+      const retryStartedMs = new Date(record.completedAt || record.startedAt || 0).getTime();
+      const isStale = Date.now() - retryStartedMs > 5 * 60 * 1000; // 5-minute lease
+      if (!isStale) {
+        throw new Error(
+          `Cannot retry post "${postId}": another retry execution is currently in progress.`
+        );
+      }
+    }
+
+    // If not publication_unknown, mark as retry_in_progress to block concurrent retries
+    if (record.status !== 'publication_unknown') {
+      transaction.update(docRef, {
+        status: 'retry_in_progress',
+        completedAt: new Date().toISOString(),
+      });
+    }
+
+    return record;
+  });
+
+  // Step 2: If status is publication_unknown, reconcile first
+  if (existingRecord.status === 'publication_unknown') {
+    console.log(`[Automation Retry] Post "${postId}" has status publication_unknown. Attempting safe reconciliation before permitting retry...`);
+    const startedMs = new Date(existingRecord.startedAt || 0).getTime();
+    const minTimestampMs = startedMs > 0 ? startedMs - 5 * 60 * 1000 : Date.now() - 24 * 60 * 60 * 1000;
+
+    const recon = await reconcileInstagramPublication(
+      existingRecord.fullInstagramText || existingRecord.caption,
+      fetcher,
+      minTimestampMs
+    );
+
+    if (recon.reconciled && recon.status === 'published') {
+      console.log(`[Automation Retry] Post "${postId}" reconciled as published (Media ID: ${recon.mediaId}). Sealing record.`);
+      const reconciledUpdate: Partial<AutomationExecutionRecord> = {
+        status: 'published',
+        instagramMediaId: recon.mediaId,
+        instagramPermalink: recon.permalink,
+        completedAt: new Date().toISOString(),
+        errorDetails: undefined,
+      };
+
+      // Atomic batch update for post document and daily lock
+      const batch = db.batch();
+      batch.update(docRef, sanitizeForFirestore(reconciledUpdate));
+
+      if (existingRecord.dateKey) {
+        const lockRef = db.collection('automation_locks').doc(existingRecord.dateKey);
+        batch.set(
+          lockRef,
+          sanitizeForFirestore({
+            status: 'published',
+            mediaId: recon.mediaId,
+            permalink: recon.permalink,
+            completedAt: new Date().toISOString(),
+          }),
+          { merge: true }
+        );
+      }
+
+      await batch.commit();
+      return { ...existingRecord, ...reconciledUpdate } as AutomationExecutionRecord;
+    }
+
+    // Fail closed! If reconciliation could not confirm post presence, refuse to create a new post or retry
+    throw new Error(
+      `Cannot retry post "${postId}" in publication_unknown state: reconciliation could not confirm post presence (${recon.errorMessage || 'unconfirmed'}). Manual verification on @califnco.water required before retrying to prevent duplicate posts.`
+    );
+  }
+
+  // Step 3: Re-attempt publishing to Instagram with dry-run protection
+  try {
+    const isDryRun = Boolean(config.instagramDryRun || process.env.INSTAGRAM_DRY_RUN === 'true');
+    const publishResult = await publishToInstagramGraphApi(
+      existingRecord.imageUrl,
+      existingRecord.fullInstagramText,
+      { isDryRun },
+      fetcher
+    );
+
+    const mediaId = publishResult.mediaId || existingRecord.instagramMediaId;
+    const permalink = publishResult.permalink || existingRecord.instagramPermalink;
+    const containerId = publishResult.containerId || existingRecord.instagramContainerId;
+    const errorMsg = publishResult.errorMessage || undefined;
+
+    const updatedRecord: Partial<AutomationExecutionRecord> = {
+      status: publishResult.status,
+      retryCount: (existingRecord.retryCount || 0) + 1,
+      completedAt: new Date().toISOString(),
+      ...(mediaId ? { instagramMediaId: mediaId } : {}),
+      ...(permalink ? { instagramPermalink: permalink } : {}),
+      ...(containerId ? { instagramContainerId: containerId } : {}),
+      ...(errorMsg ? { errorDetails: errorMsg } : {}),
+    };
+
+    // Atomic batch update for retry result
+    const batch = db.batch();
+    batch.update(docRef, sanitizeForFirestore(updatedRecord));
+
+    if (existingRecord.dateKey) {
+      const lockRef = db.collection('automation_locks').doc(existingRecord.dateKey);
+      if (publishResult.status === 'published') {
+        batch.set(
+          lockRef,
+          sanitizeForFirestore({
+            status: 'published',
+            mediaId,
+            permalink,
+            completedAt: new Date().toISOString(),
+          }),
+          { merge: true }
+        );
+      } else if (publishResult.status === 'publication_unknown') {
+        batch.set(
+          lockRef,
+          sanitizeForFirestore({
+            status: 'publication_unknown',
+            containerId,
+            errorDetails: errorMsg || 'Publication state ambiguous after retry',
+            completedAt: new Date().toISOString(),
+          }),
+          { merge: true }
+        );
+      }
+    }
+
+    await batch.commit();
+    return { ...existingRecord, ...updatedRecord } as AutomationExecutionRecord;
+  } catch (err) {
+    // If publish threw an unexpected error, revert retry_in_progress back to failed
+    await docRef
+      .update(
+        sanitizeForFirestore({
+          status: 'failed',
+          errorDetails: (err as Error)?.message || 'Retry failed unexpectedly',
+          completedAt: new Date().toISOString(),
+        })
+      )
+      .catch(() => {});
+    throw err;
+  }
+}
+
+/**
+ * Safely reconciles an ambiguous post execution record with the Instagram account.
+ * If evidence of the post is found, atomically seals the record and daily lock as 'published'.
+ * If indeterminate, preserves 'publication_unknown' to fail closed.
+ */
+export async function reconcilePostRecord(
+  postId: string,
+  fetcher: typeof fetch = fetch
+): Promise<{ reconciled: boolean; record: AutomationExecutionRecord; message: string }> {
   const docRef = db.collection('instagram_posts').doc(postId);
   const snap = await docRef.get();
 
@@ -548,29 +734,63 @@ export async function retryInstagramPost(postId: string): Promise<AutomationExec
 
   const existingRecord = snap.data() as AutomationExecutionRecord;
 
-  // Re-attempt publishing to Instagram with dry-run protection
-  const isDryRun = Boolean(config.instagramDryRun || process.env.INSTAGRAM_DRY_RUN === 'true');
-  const publishResult = await publishToInstagramGraphApi(
-    existingRecord.imageUrl,
-    existingRecord.fullInstagramText,
-    { isDryRun }
+  if (existingRecord.status === 'published') {
+    return {
+      reconciled: true,
+      record: existingRecord,
+      message: 'Post is already confirmed as published.',
+    };
+  }
+
+  const startedMs = new Date(existingRecord.startedAt || 0).getTime();
+  const minTimestampMs = startedMs > 0 ? startedMs - 5 * 60 * 1000 : Date.now() - 24 * 60 * 60 * 1000;
+
+  const recon = await reconcileInstagramPublication(
+    existingRecord.fullInstagramText || existingRecord.caption,
+    fetcher,
+    minTimestampMs
   );
 
-  const mediaId = publishResult.mediaId || existingRecord.instagramMediaId;
-  const permalink = publishResult.permalink || existingRecord.instagramPermalink;
-  const containerId = publishResult.containerId || existingRecord.instagramContainerId;
-  const errorMsg = publishResult.errorMessage || undefined;
+  if (recon.reconciled && recon.status === 'published') {
+    const updatedRecord: Partial<AutomationExecutionRecord> = {
+      status: 'published',
+      instagramMediaId: recon.mediaId,
+      instagramPermalink: recon.permalink,
+      completedAt: new Date().toISOString(),
+      errorDetails: undefined,
+    };
 
-  const updatedRecord: Partial<AutomationExecutionRecord> = {
-    status: publishResult.status,
-    retryCount: (existingRecord.retryCount || 0) + 1,
-    completedAt: new Date().toISOString(),
-    ...(mediaId ? { instagramMediaId: mediaId } : {}),
-    ...(permalink ? { instagramPermalink: permalink } : {}),
-    ...(containerId ? { instagramContainerId: containerId } : {}),
-    ...(errorMsg ? { errorDetails: errorMsg } : {}),
+    // Atomic batch update for post document and daily lock
+    const batch = db.batch();
+    batch.update(docRef, sanitizeForFirestore(updatedRecord));
+
+    if (existingRecord.dateKey) {
+      const lockRef = db.collection('automation_locks').doc(existingRecord.dateKey);
+      batch.set(
+        lockRef,
+        sanitizeForFirestore({
+          status: 'published',
+          mediaId: recon.mediaId,
+          permalink: recon.permalink,
+          completedAt: new Date().toISOString(),
+        }),
+        { merge: true }
+      );
+    }
+
+    await batch.commit();
+
+    const merged = { ...existingRecord, ...updatedRecord } as AutomationExecutionRecord;
+    return {
+      reconciled: true,
+      record: merged,
+      message: `Successfully reconciled with Instagram! Post confirmed published (Media ID: ${recon.mediaId}).`,
+    };
+  }
+
+  return {
+    reconciled: false,
+    record: existingRecord,
+    message: recon.errorMessage || 'No matching post found on Instagram account. Status remains publication_unknown.',
   };
-
-  await docRef.update(sanitizeForFirestore(updatedRecord));
-  return { ...existingRecord, ...updatedRecord } as AutomationExecutionRecord;
 }
