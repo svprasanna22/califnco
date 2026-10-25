@@ -63,28 +63,40 @@ async function generateWithPollinations(prompt: string): Promise<{ buffer: Buffe
   const seed = Math.floor(Math.random() * 100000);
   const imageUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=1080&height=1080&nologo=true&model=flux&seed=${seed}`;
 
-  try {
-    const response = await fetch(imageUrl, {
-      method: 'GET',
-      headers: {
-        Accept: 'image/jpeg,image/png,image/*',
-      },
-    });
+  // Pollinations can temporarily return 503/429. Retry a couple of times with
+  // short backoff before allowing the configured provider fallback to run.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await fetch(imageUrl, {
+        method: 'GET',
+        headers: {
+          Accept: 'image/jpeg,image/png,image/*',
+        },
+      });
 
-    if (!response.ok) {
-      console.warn(`[Pollinations AI] Request failed with status ${response.status}`);
-      return null;
+      if (!response.ok) {
+        console.warn(`[Pollinations AI] Request failed with status ${response.status} (attempt ${attempt}/3)`);
+        if ((response.status === 429 || response.status >= 500) && attempt < 3) {
+          await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+          continue;
+        }
+        return null;
+      }
+
+      const arrayBuffer = await response.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      if (buffer.length < 1000) {
+        console.warn('[Pollinations AI] Response was too small to be a valid image.');
+        return null;
+      }
+
+      return { buffer, url: imageUrl };
+    } catch (err) {
+      console.warn(`[Pollinations AI] Fetch error (attempt ${attempt}/3):`, err);
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
     }
-
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    if (buffer.length < 1000) return null;
-
-    return { buffer, url: imageUrl };
-  } catch (err) {
-    console.warn('[Pollinations AI] Fetch error:', err);
-    return null;
   }
+  return null;
 }
 
 /**
