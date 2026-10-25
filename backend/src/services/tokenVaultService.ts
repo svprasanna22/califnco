@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { db } from '../firebase';
 import { config, updateInstagramAccessToken, isEncryptionKeyValid } from '../config';
+import { sanitizeForFirestore } from './orderCalculation';
 
 export interface EncryptedVaultPayload {
   ciphertext: string;
@@ -90,11 +91,11 @@ export async function saveEncryptedTokenToVault(
   const vaultRecord: EncryptedVaultPayload = {
     ...encrypted,
     updatedAt: new Date().toISOString(),
-    expiresAt: metadata.expiresAt,
-    expiresInDays: metadata.expiresInDays,
+    ...(metadata.expiresAt !== undefined ? { expiresAt: metadata.expiresAt } : {}),
+    ...(metadata.expiresInDays !== undefined ? { expiresInDays: metadata.expiresInDays } : {}),
   };
 
-  await db.collection('system_secure_vault').doc('instagram_token').set(vaultRecord);
+  await db.collection('system_secure_vault').doc('instagram_token').set(sanitizeForFirestore(vaultRecord));
 }
 
 /**

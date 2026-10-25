@@ -7,6 +7,7 @@ import {
   getCurrentDateKey,
 } from '../services/instagramAutomation';
 import { refreshInstagramLongLivedToken } from '../services/instagramPublishService';
+import { sanitizeForFirestore } from '../services/orderCalculation';
 
 export const automationRouter = Router();
 
@@ -200,10 +201,10 @@ automationRouter.post('/refresh-token', requireAutomationAuth, async (req: Reque
 
     // Persist refresh metadata in Firestore (without exposing the token)
     await db.collection('automation_state').doc('instagram_automation').set(
-      {
+      sanitizeForFirestore({
         tokenLastRefreshedAt: new Date().toISOString(),
-        tokenExpiresInDays: result.expiresInDays,
-      },
+        ...(result.expiresInDays !== undefined ? { tokenExpiresInDays: result.expiresInDays } : {}),
+      }),
       { merge: true }
     );
 

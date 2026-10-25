@@ -13,6 +13,7 @@ import {
   type InstagramPublishResult,
 } from './instagramPublishService';
 import { saveEncryptedTokenToVault } from './tokenVaultService';
+import { sanitizeForFirestore } from './orderCalculation';
 
 export interface AutomationRunOptions {
   force?: boolean;
@@ -417,7 +418,6 @@ export async function executeDailyInstagramPosting(
     productName: selectedProduct.name,
     productCategory: selectedProduct.category,
     productPrice: selectedProduct.price,
-    productOriginalImage: selectedProduct.imageUrl,
     imageUrl: hostedResult.publicUrl,
     caption: captionResult.caption,
     hashtags: captionResult.hashtags,
@@ -429,23 +429,24 @@ export async function executeDailyInstagramPosting(
       hosting: hostedResult.provider,
       publishing: 'instagram-graph-api-v21.0',
     },
-    instagramMediaId: publishResult.mediaId,
-    instagramPermalink: publishResult.permalink,
-    instagramContainerId: publishResult.containerId,
-    errorDetails,
     startedAt: startedAt.toISOString(),
     completedAt: completedAt.toISOString(),
     durationMs,
     retryCount: 0,
     idempotencyKey,
     isManualTrigger: !!options.isManualTrigger,
+    ...(selectedProduct.imageUrl ? { productOriginalImage: selectedProduct.imageUrl } : {}),
+    ...(publishResult?.mediaId ? { instagramMediaId: publishResult.mediaId } : {}),
+    ...(publishResult?.permalink ? { instagramPermalink: publishResult.permalink } : {}),
+    ...(publishResult?.containerId ? { instagramContainerId: publishResult.containerId } : {}),
+    ...(errorDetails ? { errorDetails } : {}),
   };
 
-  await db.collection('instagram_posts').doc(runId).set(record);
+  await db.collection('instagram_posts').doc(runId).set(sanitizeForFirestore(record));
 
   // Update daily lock with terminal status
   await db.collection('automation_locks').doc(dateKey).set(
-    {
+    sanitizeForFirestore({
       dateKey,
       runId,
       status: runStatus,
@@ -455,7 +456,7 @@ export async function executeDailyInstagramPosting(
       mediaId: publishResult?.mediaId || null,
       permalink: publishResult?.permalink || null,
       errorDetails: errorDetails || null,
-    },
+    }),
     { merge: true }
   );
 
@@ -464,7 +465,7 @@ export async function executeDailyInstagramPosting(
     .collection('automation_state')
     .doc('instagram_automation')
     .set(
-      {
+      sanitizeForFirestore({
         lastRunId: runId,
         lastRunDateKey: dateKey,
         lastRunStatus: runStatus,
@@ -473,7 +474,7 @@ export async function executeDailyInstagramPosting(
         lastProductIndex: productIndex,
         lastUpdated: FieldValue.serverTimestamp(),
         lastRunDurationMs: durationMs,
-      },
+      }),
       { merge: true }
     );
 
@@ -502,16 +503,21 @@ export async function retryInstagramPost(postId: string): Promise<AutomationExec
     { isDryRun }
   );
 
+  const mediaId = publishResult.mediaId || existingRecord.instagramMediaId;
+  const permalink = publishResult.permalink || existingRecord.instagramPermalink;
+  const containerId = publishResult.containerId || existingRecord.instagramContainerId;
+  const errorMsg = publishResult.errorMessage || undefined;
+
   const updatedRecord: Partial<AutomationExecutionRecord> = {
     status: publishResult.status,
-    instagramMediaId: publishResult.mediaId || existingRecord.instagramMediaId,
-    instagramPermalink: publishResult.permalink || existingRecord.instagramPermalink,
-    instagramContainerId: publishResult.containerId || existingRecord.instagramContainerId,
-    errorDetails: publishResult.errorMessage || undefined,
     retryCount: (existingRecord.retryCount || 0) + 1,
     completedAt: new Date().toISOString(),
+    ...(mediaId ? { instagramMediaId: mediaId } : {}),
+    ...(permalink ? { instagramPermalink: permalink } : {}),
+    ...(containerId ? { instagramContainerId: containerId } : {}),
+    ...(errorMsg ? { errorDetails: errorMsg } : {}),
   };
 
-  await docRef.update(updatedRecord);
+  await docRef.update(sanitizeForFirestore(updatedRecord));
   return { ...existingRecord, ...updatedRecord } as AutomationExecutionRecord;
 }

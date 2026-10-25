@@ -20,6 +20,7 @@ import {
   decryptSecret,
   deriveKeyBuffer,
 } from '../services/tokenVaultService';
+import { sanitizeForFirestore } from '../services/orderCalculation';
 
 async function runAutomationTests() {
   console.log('--- Starting Califnco AI Instagram Automation Unit Tests ---\n');
@@ -213,7 +214,43 @@ async function runAutomationTests() {
   config.instagramDryRun = prevDryRun; // Restore
   console.log('   [PASS] Global dry-run guard verified: no live Meta publish request can occur on scheduled runs or retries');
 
-  console.log('\n--- All 15 AI Instagram Automation Unit Tests Passed Successfully! ---');
+  // Test 16: Firestore Payload Sanitization & Dry-Run 'undefined' Property Regression Test
+  console.log('\n16. Testing Firestore payload sanitization (purging undefined properties)...');
+  const dryRunExecution = await publishToInstagramGraphApi(validImageUrl, captionResult.fullInstagramText, { isDryRun: true });
+  assert(dryRunExecution.containerId === undefined, 'Dry-run execution intentionally returns undefined containerId');
+
+  // Reproduce the previous bug: direct assignment of undefined property
+  const dirtyExecutionPayload: Record<string, any> = {
+    runId: 'test_run_123',
+    productId: mockProduct.id,
+    instagramContainerId: dryRunExecution.containerId, // This was undefined!
+    instagramMediaId: dryRunExecution.mediaId,
+    errorDetails: undefined,
+  };
+  assert(dirtyExecutionPayload.hasOwnProperty('instagramContainerId'), 'Dirty object contains undefined key');
+  assert(dirtyExecutionPayload.instagramContainerId === undefined, 'Field is undefined before sanitization');
+
+  // Verify sanitized output completely purges undefined properties
+  const cleanPayload = sanitizeForFirestore(dirtyExecutionPayload);
+  assert(!cleanPayload.hasOwnProperty('instagramContainerId'), 'Sanitizer must remove undefined instagramContainerId');
+  assert(!cleanPayload.hasOwnProperty('errorDetails'), 'Sanitizer must remove undefined errorDetails');
+  assert(cleanPayload.runId === 'test_run_123', 'Sanitizer must preserve valid fields');
+  assert(cleanPayload.instagramMediaId === dryRunExecution.mediaId, 'Sanitizer must preserve valid mediaId');
+  assert(Object.values(cleanPayload).every((val) => val !== undefined), 'Cleaned payload must contain zero undefined values');
+
+  // Verify retry payload construction when both publishResult and existingRecord have no containerId
+  const existingRecordNoContainer: Record<string, any> = { instagramMediaId: 'prev_media_1' };
+  const retryContainerId = dryRunExecution.containerId || existingRecordNoContainer.instagramContainerId;
+  const retryPayload = sanitizeForFirestore({
+    status: dryRunExecution.status,
+    ...(retryContainerId ? { instagramContainerId: retryContainerId } : {}),
+  });
+  assert(!retryPayload.hasOwnProperty('instagramContainerId'), 'Retry payload must omit undefined instagramContainerId');
+  assert(Object.values(retryPayload).every((val) => val !== undefined), 'Retry payload must contain zero undefined values');
+
+  console.log('   [PASS] Firestore payload sanitization verified: zero undefined properties permitted in document writes');
+
+  console.log('\n--- All 16 AI Instagram Automation Unit Tests Passed Successfully! ---');
 }
 
 runAutomationTests().catch((err) => {
