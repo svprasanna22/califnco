@@ -354,25 +354,8 @@ export async function executeDailyInstagramPosting(
 
   try {
     // ----------------------------------------------------
-    // STEP 3: Generate Marketing Caption & Hashtags
-    // ----------------------------------------------------
-    captionResult = await generateInstagramCaption(selectedProduct);
-    console.log(`[Automation] Caption generated via provider: ${captionResult.provider}`);
-
-    // ----------------------------------------------------
-    // STEP 4: Generate Promotional Product Image
-    // ----------------------------------------------------
-    imageResult = await generatePromotionalImage(selectedProduct);
-    console.log(`[Automation] Promotional image generated via provider: ${imageResult.provider}`);
-
-    // ----------------------------------------------------
-    // STEP 5: Host Image on Verified Public HTTPS Endpoint
-    // ----------------------------------------------------
-    hostedResult = await hostPromotionalImage(imageResult.imageBuffer, imageResult.directPublicUrl);
-    console.log(`[Automation] Image hosted on verified public URL via: ${hostedResult.provider}`);
-
-    // ----------------------------------------------------
-    // STEP 6: Token Age Verification & Safe Auto-Refresh
+    // STEP 3: Verify Instagram token before doing provider-dependent work.
+    // This ensures a temporary image-provider outage does not hide auth status.
     // ----------------------------------------------------
     const tokenCheck = await ensureValidInstagramToken();
     if (!tokenCheck.ready) {
@@ -380,7 +363,25 @@ export async function executeDailyInstagramPosting(
     }
 
     // ----------------------------------------------------
-    // STEP 6b: Publish to Meta Instagram Graph API
+    // STEP 4: Generate Marketing Caption & Hashtags
+    // ----------------------------------------------------
+    captionResult = await generateInstagramCaption(selectedProduct);
+    console.log(`[Automation] Caption generated via provider: ${captionResult.provider}`);
+
+    // ----------------------------------------------------
+    // STEP 5: Generate Promotional Product Image
+    // ----------------------------------------------------
+    imageResult = await generatePromotionalImage(selectedProduct);
+    console.log(`[Automation] Promotional image generated via provider: ${imageResult.provider}`);
+
+    // ----------------------------------------------------
+    // STEP 6: Host Image on Verified Public HTTPS Endpoint
+    // ----------------------------------------------------
+    hostedResult = await hostPromotionalImage(imageResult.imageBuffer, imageResult.directPublicUrl);
+    console.log(`[Automation] Image hosted on verified public URL via: ${hostedResult.provider}`);
+
+    // ----------------------------------------------------
+    // STEP 7: Publish to Meta Instagram Graph API
     // ----------------------------------------------------
     const isDryRun = config.instagramDryRun || process.env.INSTAGRAM_DRY_RUN === 'true';
     publishResult = await publishToInstagramGraphApi(
