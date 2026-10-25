@@ -10,6 +10,7 @@ import {
   publishToInstagramGraphApi,
   getInstagramApiBaseUrl,
   refreshInstagramLongLivedToken,
+  verifyInstagramAccessToken,
 } from '../services/instagramPublishService';
 import {
   getCurrentDateKey,
@@ -100,6 +101,26 @@ async function runAutomationTests() {
   const refreshResult = await refreshInstagramLongLivedToken('');
   assert(refreshResult.success === false, 'Empty token must safely fail without crashing');
   console.log('   [PASS] Token refresh guard safely caught unconfigured environment');
+  
+  // Test 7b: Read-only Instagram token verification using a mocked API response
+  console.log('\n7b. Testing read-only Instagram token verification...');
+  const validVerification = await verifyInstagramAccessToken('IG_test_token', async (input) => {
+    const requestUrl = new URL(String(input));
+    assert(requestUrl.pathname.endsWith('/me'), 'Verification must use the read-only /me endpoint');
+    assert(requestUrl.searchParams.get('fields') === 'user_id,username', 'Instagram Login must request account identity fields');
+    return new Response(JSON.stringify({ user_id: 'test-account-123', username: 'califnco.water' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  });
+  assert(validVerification.valid === true, 'Valid API identity response should pass verification');
+  assert(validVerification.accountId === 'test-account-123', 'Verification should return account ID');
+  const invalidVerification = await verifyInstagramAccessToken('IG_test_token', async () =>
+    new Response(JSON.stringify({ error: { message: 'Invalid OAuth access token' } }), { status: 401 })
+  );
+  assert(invalidVerification.valid === false, 'Rejected API token should fail verification');
+  assert(!JSON.stringify(invalidVerification).includes('IG_test_token'), 'Verification result must not expose the token');
+  console.log('   [PASS] Read-only token verification handles accepted and rejected tokens without exposing credentials');
 
   // Test 8: AUTOMATION_CRON_SECRET Cryptographic Strength Validator
   console.log('\n8. Testing AUTOMATION_CRON_SECRET strength validation...');
