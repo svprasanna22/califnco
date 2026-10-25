@@ -10,6 +10,7 @@ import { hostPromotionalImage, type HostedImageResult } from './imageHostingServ
 import {
   publishToInstagramGraphApi,
   refreshInstagramLongLivedToken,
+  verifyInstagramAccessToken,
   type InstagramPublishResult,
 } from './instagramPublishService';
 import { saveEncryptedTokenToVault } from './tokenVaultService';
@@ -60,6 +61,11 @@ export async function ensureValidInstagramToken(): Promise<{ ready: boolean; err
       const refreshResult = await refreshInstagramLongLivedToken(config.instagramAccessToken);
 
       if (refreshResult.success && refreshResult.refreshedToken) {
+        const refreshedTokenVerification = await verifyInstagramAccessToken(refreshResult.refreshedToken);
+        if (!refreshedTokenVerification.valid) {
+          return { ready: false, error: refreshedTokenVerification.error || 'Refreshed Instagram token could not be verified.' };
+        }
+
         // 1. Update in server-side memory
         updateInstagramAccessToken(refreshResult.refreshedToken);
 
@@ -108,10 +114,16 @@ export async function ensureValidInstagramToken(): Promise<{ ready: boolean; err
       }
     }
 
+    const verification = await verifyInstagramAccessToken(config.instagramAccessToken);
+    if (!verification.valid) {
+      return { ready: false, error: verification.error || 'Instagram access token could not be verified.' };
+    }
+
+    console.log('[Token Guard] Instagram access token verified with a read-only API request.');
     return { ready: true };
   } catch (err: unknown) {
-    console.warn('[Token Guard] Error during token age verification:', err);
-    return { ready: true };
+    console.warn('[Token Guard] Token verification failed due to an internal error:', (err as Error)?.message || 'Unexpected error');
+    return { ready: false, error: 'Instagram token verification could not be completed safely.' };
   }
 }
 
@@ -363,7 +375,7 @@ export async function executeDailyInstagramPosting(
     // STEP 6: Token Age Verification & Safe Auto-Refresh
     // ----------------------------------------------------
     const tokenCheck = await ensureValidInstagramToken();
-    if (!tokenCheck.ready && !config.instagramDryRun) {
+    if (!tokenCheck.ready) {
       throw new Error(`Token validation failure: ${tokenCheck.error}`);
     }
 

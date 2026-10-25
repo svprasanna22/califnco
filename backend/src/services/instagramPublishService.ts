@@ -40,6 +40,58 @@ export function getInstagramApiBaseUrl(token: string): string {
   return 'https://graph.instagram.com/v21.0';
 }
 
+export interface InstagramTokenVerificationResult {
+  valid: boolean;
+  accountId?: string;
+  username?: string;
+  error?: string;
+}
+
+/**
+ * Performs a read-only request to confirm Instagram currently accepts the access token.
+ * The token is never included in logs or returned in the result.
+ * An optional fetch implementation is provided for deterministic unit tests.
+ */
+export async function verifyInstagramAccessToken(
+  accessToken: string,
+  fetcher: typeof fetch = fetch
+): Promise<InstagramTokenVerificationResult> {
+  const token = accessToken.trim();
+  if (!token) {
+    return { valid: false, error: 'Instagram access token is not configured.' };
+  }
+
+  const baseUrl = getInstagramApiBaseUrl(token);
+  const isInstagramLogin = baseUrl.includes('graph.instagram.com');
+  const verificationUrl = new URL(`${baseUrl}/me`);
+  verificationUrl.searchParams.set('fields', isInstagramLogin ? 'user_id,username' : 'id,name');
+  verificationUrl.searchParams.set('access_token', token);
+
+  try {
+    const response = await fetcher(verificationUrl.toString(), { method: 'GET' });
+    const data: any = await response.json().catch(() => ({}));
+    const accountId = data?.user_id ?? data?.id;
+
+    if (!response.ok || !accountId) {
+      const apiMessage = typeof data?.error?.message === 'string' ? data.error.message : '';
+      return {
+        valid: false,
+        error: apiMessage
+          ? `Instagram rejected the access token: ${apiMessage}`
+          : `Instagram token verification failed (HTTP ${response.status}).`,
+      };
+    }
+
+    return {
+      valid: true,
+      accountId: String(accountId),
+      ...(typeof data?.username === 'string' ? { username: data.username } : {}),
+    };
+  } catch {
+    return { valid: false, error: 'Could not reach Instagram to verify the access token.' };
+  }
+}
+
 /**
  * Safely resolves the numeric Instagram Account ID if given 'me' or a username like '@califnco.water'
  */

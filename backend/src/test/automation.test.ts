@@ -10,6 +10,7 @@ import {
   publishToInstagramGraphApi,
   getInstagramApiBaseUrl,
   refreshInstagramLongLivedToken,
+  verifyInstagramAccessToken,
 } from '../services/instagramPublishService';
 import {
   getCurrentDateKey,
@@ -100,6 +101,26 @@ async function runAutomationTests() {
   const refreshResult = await refreshInstagramLongLivedToken('');
   assert(refreshResult.success === false, 'Empty token must safely fail without crashing');
   console.log('   [PASS] Token refresh guard safely caught unconfigured environment');
+  
+  // Test 7b: Read-only Instagram token verification using a mocked API response
+  console.log('\n7b. Testing read-only Instagram token verification...');
+  const validVerification = await verifyInstagramAccessToken('IG_test_token', async (input) => {
+    const requestUrl = new URL(String(input));
+    assert(requestUrl.pathname.endsWith('/me'), 'Verification must use the read-only /me endpoint');
+    assert(requestUrl.searchParams.get('fields') === 'user_id,username', 'Instagram Login must request account identity fields');
+    return new Response(JSON.stringify({ user_id: 'test-account-123', username: 'califnco.water' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  });
+  assert(validVerification.valid === true, 'Valid API identity response should pass verification');
+  assert(validVerification.accountId === 'test-account-123', 'Verification should return account ID');
+  const invalidVerification = await verifyInstagramAccessToken('IG_test_token', async () =>
+    new Response(JSON.stringify({ error: { message: 'Invalid OAuth access token' } }), { status: 401 })
+  );
+  assert(invalidVerification.valid === false, 'Rejected API token should fail verification');
+  assert(!JSON.stringify(invalidVerification).includes('IG_test_token'), 'Verification result must not expose the token');
+  console.log('   [PASS] Read-only token verification handles accepted and rejected tokens without exposing credentials');
 
   // Test 8: AUTOMATION_CRON_SECRET Cryptographic Strength Validator
   console.log('\n8. Testing AUTOMATION_CRON_SECRET strength validation...');
@@ -116,11 +137,15 @@ async function runAutomationTests() {
   assert(strongCheck.valid === true, 'Strong 36-char random secret must be accepted');
   console.log('   [PASS] Secret validator enforces strict cryptographic strength and rejects weak/predictable keys');
 
-  // Test 9: Token Age & Expiration Pre-Flight Guard
-  console.log('\n9. Testing token age & expiration pre-flight guard...');
+  // Test 9: Token pre-flight handles missing credentials without making a network request
+  console.log('\\n9. Testing token pre-flight guard with missing credentials...');
+  const savedPreflightToken = config.instagramAccessToken;
+  config.instagramAccessToken = '';
   const tokenPreflight = await ensureValidInstagramToken();
-  assert(typeof tokenPreflight.ready === 'boolean', 'Pre-flight check must return boolean status');
-  console.log('   [PASS] Token pre-flight check evaluated safely without crashing or exposing credentials');
+  assert(tokenPreflight.ready === false, 'Pre-flight must reject a missing access token');
+  assert(typeof tokenPreflight.error === 'string', 'Pre-flight should explain missing credentials');
+  config.instagramAccessToken = savedPreflightToken;
+  console.log('   [PASS] Token pre-flight rejects missing credentials without an Instagram API request');
 
   // Test 10: In-Memory Secret Token Isolation
   console.log('\n10. Testing in-memory secret token update isolation...');
