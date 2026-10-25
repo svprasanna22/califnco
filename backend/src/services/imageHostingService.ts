@@ -16,7 +16,7 @@ async function uploadToCloudinary(imageBuffer: Buffer): Promise<string | null> {
   const url = `https://api.cloudinary.com/v1_1/${cloudName}/image/upload`;
   const formData = new FormData();
   formData.append('file', `data:image/jpeg;base64,${imageBuffer.toString('base64')}`);
-  formData.append('folder', 'califnco_instagram');
+  formData.append('folder', 'califnco/instagram');
 
   // Option A: Unsigned Upload Preset (zero secret leakage)
   if (config.cloudinaryUploadPreset) {
