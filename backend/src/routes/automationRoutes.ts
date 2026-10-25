@@ -69,6 +69,7 @@ automationRouter.get('/status', async (req: Request, res: Response) => {
     const todayDoc = await db
       .collection('instagram_posts')
       .where('dateKey', '==', todayKey)
+      .orderBy('startedAt', 'desc')
       .limit(1)
       .get();
 
@@ -87,13 +88,13 @@ automationRouter.get('/status', async (req: Request, res: Response) => {
       todayStatus: todayPost?.status || 'scheduled_pending',
       todayPostSummary: todayPost
         ? {
-            id: todayPost.id,
-            productName: todayPost.productName,
-            status: todayPost.status,
-            permalink: todayPost.instagramPermalink || null,
-            imageUrl: todayPost.imageUrl,
-            timestamp: todayPost.completedAt,
-          }
+          id: todayPost.id,
+          productName: todayPost.productName,
+          status: todayPost.status,
+          permalink: todayPost.instagramPermalink || null,
+          imageUrl: todayPost.imageUrl,
+          timestamp: todayPost.completedAt,
+        }
         : null,
       credentialsHealth,
       lastExecution: stateData || null,
